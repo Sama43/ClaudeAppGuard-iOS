@@ -176,7 +176,7 @@ enum TunnelSingBoxConfigGenerator {
                     "tag": "tun-in",
                     "interface_name": "utun0",
                     "address": ["198.18.0.1/32", "fc00::1/128"],
-                    "mtu": 8500,
+                    "mtu": 4064,
                     "auto_route": false,
                     "stack": "gvisor"
                 ],

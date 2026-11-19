@@ -2,7 +2,32 @@ import Foundation
 
 enum SharedConstants {
     static let appGroupId = "group.com.claudeguard.iosvpn"
-    static let tunnelBundleId = "com.claudeguard.iosvpn.PacketTunnel"
+    static let defaultTunnelBundleId = "com.claudeguard.iosvpn.PacketTunnel"
+
+    /// Dynamically discovers the embedded PacketTunnel .appex bundle ID so re-signing with a custom Bundle ID works seamlessly.
+    static func resolvedTunnelBundleId() -> String {
+        if let plugInsURL = Bundle.main.builtInPlugInsURL,
+           let items = try? FileManager.default.contentsOfDirectory(at: plugInsURL, includingPropertiesForKeys: nil) {
+            for item in items where item.pathExtension == "appex" {
+                if let extBundle = Bundle(url: item),
+                   let extId = extBundle.bundleIdentifier, !extId.isEmpty {
+                    return extId
+                }
+            }
+        }
+        if let mainId = Bundle.main.bundleIdentifier, !mainId.isEmpty {
+            return "\(mainId).PacketTunnel"
+        }
+        return defaultTunnelBundleId
+    }
+}
+
+/// Self-contained config payload passed directly to PacketTunnel via providerConfiguration / startTunnel(options:) / XPC IPC,
+/// so PacketTunnel works even when IPA re-signing strips or renames App Group entitlements.
+struct TunnelLaunchPayload: Codable {
+    var node: ProxyNode
+    var session: AppIdentitySession?
+    var settings: VpnGuardSettings
 }
 
 enum ProxyProtocol: String, Codable, CaseIterable {

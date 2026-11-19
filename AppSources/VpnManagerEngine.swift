@@ -14,6 +14,22 @@ final class VpnManagerEngine: ObservableObject {
     @Published var settings: VpnGuardSettings = VpnGuardSettings()
     @Published var activeSessionId: UUID? = nil
     @Published var localEvents: [SecurityEvent] = []
+    @Published var lastDisconnectError: String? = nil
+
+    let resolvedExtensionId: String = SharedConstants.resolvedTunnelBundleId()
+    let appGroupAvailable: Bool = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: SharedConstants.appGroupId) != nil
+
+    var vpnStatusText: String {
+        switch vpnStatus {
+        case .invalid: return "无效/未配置"
+        case .disconnected: return "未连接"
+        case .connecting: return "正在拉起扩展..."
+        case .connected: return "系统 VPN 已接管"
+        case .reasserting: return "正在重连..."
+        case .disconnecting: return "正在断开..."
+        @unknown default: return "未知状态"
+        }
+    }
 
     var activeSession: AppIdentitySession? {
         guard let id = activeSessionId else { return nil }
@@ -26,7 +42,10 @@ final class VpnManagerEngine: ObservableObject {
 
     private let storage = SharedStorage()
     private var manager: NETunnelProviderManager?
+    private var statusObserver: NSObjectProtocol?
     private var pollTask: Task<Void, Never>?
+    private var startupWatchTask: Task<Void, Never>?
+    private var userRequestedStop = false
 
     init() {
         self.nodes = storage.loadNodes()
@@ -49,14 +68,24 @@ final class VpnManagerEngine: ObservableObject {
         NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if let existing = managers?.first {
+                if let error {
+                    self.recordLocalEvent(.warn, tag: "VPN", "读取系统 VPN 配置失败: \(error.localizedDescription)")
+                }
+                if let existing = managers?.first(where: {
+                    ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == self.resolvedExtensionId
+                }) ?? managers?.first {
                     self.manager = existing
                     self.vpnStatus = existing.connection.status
                     self.observeVpnStatus(existing)
+                    if existing.connection.status == .connected {
+                        self.sendTunnelCommand("status")
+                    } else {
+                        self.snapshot.status = .stopped
+                    }
                 } else {
                     let mgr = NETunnelProviderManager()
                     let proto = NETunnelProviderProtocol()
-                    proto.providerBundleIdentifier = SharedConstants.tunnelBundleId
+                    proto.providerBundleIdentifier = self.resolvedExtensionId
                     proto.serverAddress = "ClaudeAppGuard"
                     mgr.protocolConfiguration = proto
                     mgr.localizedDescription = "ClaudeAppGuard 官方客户端隔离"
@@ -69,18 +98,55 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     private func observeVpnStatus(_ mgr: NETunnelProviderManager) {
-        NotificationCenter.default.addObserver(
+        if let old = statusObserver {
+            NotificationCenter.default.removeObserver(old)
+            statusObserver = nil
+        }
+        statusObserver = NotificationCenter.default.addObserver(
             forName: .NEVPNStatusDidChange,
             object: mgr.connection,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.vpnStatus = mgr.connection.status
-                if self.vpnStatus == .disconnected || self.vpnStatus == .invalid {
-                    self.snapshot.status = .stopped
-                } else {
+                let newStatus = mgr.connection.status
+                if newStatus == self.vpnStatus { return }
+                self.vpnStatus = newStatus
+                self.recordLocalEvent(.info, tag: "VPN", "系统 VPN 状态变更 -> \(self.vpnStatusText)")
+
+                switch newStatus {
+                case .connected:
+                    self.startupWatchTask?.cancel()
+                    self.lastDisconnectError = nil
                     self.sendTunnelCommand("status")
+
+                case .disconnected, .invalid:
+                    self.startupWatchTask?.cancel()
+                    self.snapshot.status = .stopped
+                    if !self.userRequestedStop {
+                        self.fetchDisconnectReason(from: mgr)
+                    }
+                    self.userRequestedStop = false
+
+                case .connecting, .reasserting:
+                    self.sendTunnelCommand("status")
+
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func fetchDisconnectReason(from mgr: NETunnelProviderManager) {
+        mgr.connection.fetchLastDisconnectError { [weak self] err in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let err {
+                    let nsErr = err as NSError
+                    let msg = "\(nsErr.localizedDescription) (domain=\(nsErr.domain), code=\(nsErr.code))"
+                    self.lastDisconnectError = msg
+                    self.recordLocalEvent(.critical, tag: "VPN", "PacketTunnel 启动/断开报错: \(msg)")
                 }
             }
         }
@@ -90,14 +156,15 @@ final class VpnManagerEngine: ObservableObject {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
                 guard let self else { break }
                 if self.vpnStatus == .connected || self.vpnStatus == .connecting {
                     self.sendTunnelCommand("status")
-                } else {
-                    self.snapshot = self.storage.loadSnapshot()
-                    if self.vpnStatus == .disconnected {
-                        self.snapshot.status = .stopped
+                } else if self.appGroupAvailable && self.snapshot.status == .stopped {
+                    // Only load cached snapshot when stopped if App Group is active
+                    let cached = self.storage.loadSnapshot()
+                    if cached.status == .stopped && !cached.recentEvents.isEmpty {
+                        self.snapshot.recentEvents = cached.recentEvents
                     }
                 }
             }
@@ -108,11 +175,13 @@ final class VpnManagerEngine: ObservableObject {
 
     func startProtection(forSessionId sessionId: UUID) {
         guard let session = sessions.first(where: { $0.id == sessionId }),
-              nodes.contains(where: { $0.id == session.boundNodeId }) else {
+              let node = nodes.first(where: { $0.id == session.boundNodeId }) else {
             recordLocalEvent(.warn, tag: "VPN", "该身份未绑定有效节点")
             return
         }
 
+        userRequestedStop = false
+        lastDisconnectError = nil
         activeSessionId = session.id
         storage.saveActiveSessionId(session.id)
         if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
@@ -120,22 +189,46 @@ final class VpnManagerEngine: ObservableObject {
             storage.saveSessions(sessions)
         }
 
+        let payload = TunnelLaunchPayload(node: node, session: session, settings: settings)
+        guard let payloadData = try? JSONEncoder().encode(payload) else {
+            recordLocalEvent(.critical, tag: "VPN", "编码隧道配置失败")
+            return
+        }
+
         if vpnStatus == .connected {
-            sendTunnelCommand("reload")
+            sendReloadPayload(payloadData)
             recordLocalEvent(.info, tag: "IDENTITY", "正在切换官方客户端身份 -> 「\(session.name)」")
             return
         }
 
         guard let mgr = manager else {
+            recordLocalEvent(.warn, tag: "VPN", "正在初始化系统 VPN 配置，请稍后再点一次")
             loadOrCreateManager()
             return
         }
 
+        snapshot.status = .startingCore
+        snapshot.activeSessionId = session.id
+        snapshot.activeSessionName = session.name
+        snapshot.activeNodeName = node.name
+        snapshot.killSwitchReason = nil
+
+        let proto = (mgr.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = resolvedExtensionId
+        proto.serverAddress = node.server
+        proto.providerConfiguration = ["payload": payloadData]
+        mgr.protocolConfiguration = proto
+        mgr.localizedDescription = "ClaudeAppGuard 官方客户端隔离"
         mgr.isEnabled = true
+
+        recordLocalEvent(.info, tag: "VPN", "准备拉起扩展 [\(resolvedExtensionId)] -> 节点 \(node.name) (AppGroup=\(appGroupAvailable ? "可用" : "降级IPC直传"))")
+
         mgr.saveToPreferences { [weak self] err in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let err {
+                    self.snapshot.status = .stopped
+                    self.lastDisconnectError = err.localizedDescription
                     self.recordLocalEvent(.critical, tag: "VPN", "保存系统 VPN 配置失败: \(err.localizedDescription)（请确认使用巨魔或带 NetworkExtension 权限的证书签名）")
                     return
                 }
@@ -143,17 +236,40 @@ final class VpnManagerEngine: ObservableObject {
                     Task { @MainActor [weak self] in
                         guard let self else { return }
                         if let loadErr {
+                            self.snapshot.status = .stopped
+                            self.lastDisconnectError = loadErr.localizedDescription
                             self.recordLocalEvent(.critical, tag: "VPN", "加载 VPN 配置失败: \(loadErr.localizedDescription)")
                             return
                         }
                         do {
-                            try (mgr.connection as? NETunnelProviderSession)?.startTunnel()
+                            try (mgr.connection as? NETunnelProviderSession)?.startTunnel(
+                                options: ["payload": payloadData as NSData]
+                            )
                             self.recordLocalEvent(.info, tag: "VPN", "已拉起系统隔离 VPN（初始黑洞保护，正在校验出口）")
+                            self.armStartupWatchdog(mgr: mgr)
                         } catch {
+                            self.snapshot.status = .stopped
+                            self.lastDisconnectError = error.localizedDescription
                             self.recordLocalEvent(.critical, tag: "VPN", "启动隔离 VPN 失败: \(error.localizedDescription)")
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private func armStartupWatchdog(mgr: NETunnelProviderManager) {
+        startupWatchTask?.cancel()
+        startupWatchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if self.vpnStatus != .connected {
+                self.fetchDisconnectReason(from: mgr)
+                let msg = "等待系统拉起 PacketTunnel 超时（当前系统状态: \(self.vpnStatusText)）。常见原因：重签工具未给 PacketTunnel 扩展正确签入 NetworkExtension 描述文件，或证书不含 VPN 权限。"
+                if self.lastDisconnectError == nil {
+                    self.lastDisconnectError = msg
+                }
+                self.recordLocalEvent(.critical, tag: "VPN", msg)
             }
         }
     }
@@ -180,10 +296,27 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     func stopVpnCompletely() {
+        userRequestedStop = true
+        startupWatchTask?.cancel()
         manager?.connection.stopVPNTunnel()
         snapshot.status = .stopped
         snapshot.killSwitchReason = nil
         recordLocalEvent(.info, tag: "VPN", "已完全关闭系统 VPN")
+    }
+
+    private func sendReloadPayload(_ payloadData: Data) {
+        let cmd = "reload_payload:" + payloadData.base64EncodedString()
+        sendTunnelCommand(cmd)
+    }
+
+    private func pushCurrentPayloadToRunningTunnel() {
+        guard vpnStatus == .connected,
+              let sess = activeSession,
+              let node = nodes.first(where: { $0.id == sess.boundNodeId }),
+              let data = try? JSONEncoder().encode(TunnelLaunchPayload(node: node, session: sess, settings: settings)) else {
+            return
+        }
+        sendReloadPayload(data)
     }
 
     private func sendTunnelCommand(_ cmd: String) {
@@ -220,7 +353,7 @@ final class VpnManagerEngine: ObservableObject {
         sessions[idx].pinnedExitIp = nil
         storage.saveSessions(sessions)
         if activeSessionId == sessionId && vpnStatus == .connected {
-            sendTunnelCommand("reload")
+            pushCurrentPayloadToRunningTunnel()
         }
     }
 
@@ -230,7 +363,7 @@ final class VpnManagerEngine: ObservableObject {
         sessions[idx].pinnedExitIp = ip
         storage.saveSessions(sessions)
         if activeSessionId == sessionId && vpnStatus == .connected {
-            sendTunnelCommand("reverify")
+            pushCurrentPayloadToRunningTunnel()
         }
     }
 
@@ -239,6 +372,9 @@ final class VpnManagerEngine: ObservableObject {
         sessions[idx].lockExitIp = false
         sessions[idx].pinnedExitIp = nil
         storage.saveSessions(sessions)
+        if activeSessionId == sessionId && vpnStatus == .connected {
+            pushCurrentPayloadToRunningTunnel()
+        }
     }
 
     func deleteSession(_ sessionId: UUID) {
@@ -356,7 +492,7 @@ final class VpnManagerEngine: ObservableObject {
         settings = copy
         storage.saveSettings(copy)
         if vpnStatus == .connected {
-            sendTunnelCommand("reload")
+            pushCurrentPayloadToRunningTunnel()
         }
     }
 

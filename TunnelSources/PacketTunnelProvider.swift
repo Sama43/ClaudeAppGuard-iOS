@@ -32,23 +32,34 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var isBlackholeActive = true
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        self.settings = storage.loadSettings()
-        let nodes = storage.loadNodes()
-        let sessions = storage.loadSessions()
-        let activeSessionId = storage.loadActiveSessionId()
+        let payload = resolveLaunchPayload(options: options)
 
-        let session = activeSessionId.flatMap { id in sessions.first { $0.id == id } } ?? sessions.first
-        let node: ProxyNode?
-        if let s = session {
-            node = nodes.first { $0.id == s.boundNodeId }
+        let targetNode: ProxyNode
+        let session: AppIdentitySession?
+
+        if let payload {
+            self.settings = payload.settings
+            targetNode = payload.node
+            session = payload.session
         } else {
-            node = nodes.first
-        }
-
-        guard let targetNode = node else {
-            let err = NSError(domain: "ClaudeAppGuard", code: 1, userInfo: [NSLocalizedDescriptionKey: "未找到可用代理节点，请先在主 App 中导入节点"])
-            completionHandler(err)
-            return
+            self.settings = storage.loadSettings()
+            let nodes = storage.loadNodes()
+            let sessions = storage.loadSessions()
+            let activeSessionId = storage.loadActiveSessionId()
+            session = activeSessionId.flatMap { id in sessions.first { $0.id == id } } ?? sessions.first
+            let fallbackNode: ProxyNode?
+            if let s = session {
+                fallbackNode = nodes.first { $0.id == s.boundNodeId }
+            } else {
+                fallbackNode = nodes.first
+            }
+            guard let resolved = fallbackNode else {
+                let err = NSError(domain: "ClaudeAppGuard", code: 1, userInfo: [NSLocalizedDescriptionKey: "未找到可用代理节点（providerConfiguration 与 App Group 均为空），请返回主 App 重新点击开启"])
+                recordEvent(.critical, tag: "TUN", err.localizedDescription)
+                completionHandler(err)
+                return
+            }
+            targetNode = resolved
         }
 
         self.currentSession = session
@@ -60,7 +71,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             activeSessionName: session?.name,
             activeNodeName: targetNode.name
         )
-        recordEvent(.info, tag: "TUN", "正在建立 iOS 隔离隧道 -> \(targetNode.name)")
+        recordEvent(.info, tag: "TUN", "正在建立 iOS 隔离隧道 -> \(targetNode.name) (\(targetNode.server):\(targetNode.port))")
 
         let netSettings = buildTunnelNetworkSettings()
         setTunnelNetworkSettings(netSettings) { [weak self] error in
@@ -83,11 +94,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.utunFd = fd
+            self.recordEvent(.info, tag: "TUN", "已接管系统 utun (fd=\(fd), probePort=\(self.probePort))")
 
             // Step 1: IMMEDIATELY start sing-box in BLACKHOLE MODE FIRST (zero startup leak!)
             let blackholeErr = self.applySingBoxMode(isBlackhole: true)
             if let blackholeErr {
-                completionHandler(NSError(domain: "ClaudeAppGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: blackholeErr]))
+                completionHandler(NSError(domain: "ClaudeAppGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: "sing-box 启动失败: \(blackholeErr)"]))
                 return
             }
 
@@ -104,6 +116,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func resolveLaunchPayload(options: [String: NSObject]?) -> TunnelLaunchPayload? {
+        let decoder = JSONDecoder()
+        if let raw = options?["payload"] as? Data,
+           let decoded = try? decoder.decode(TunnelLaunchPayload.self, from: raw) {
+            return decoded
+        }
+        if let proto = self.protocolConfiguration as? NETunnelProviderProtocol,
+           let raw = proto.providerConfiguration?["payload"] as? Data,
+           let decoded = try? decoder.decode(TunnelLaunchPayload.self, from: raw) {
+            return decoded
+        }
+        return nil
+    }
+
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         watchdogTask?.cancel()
         pathMonitor.cancel()
@@ -116,6 +142,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         let cmd = String(data: messageData, encoding: .utf8) ?? ""
+        if cmd.hasPrefix("reload_payload:") {
+            let b64 = String(cmd.dropFirst("reload_payload:".count))
+            if let raw = Data(base64Encoded: b64),
+               let payload = try? JSONDecoder().decode(TunnelLaunchPayload.self, from: raw) {
+                Task {
+                    self.applyLaunchPayload(payload)
+                    await self.verifyAndActivateIfSafe(enrichGeo: true)
+                    completionHandler?(self.encodeSnapshot())
+                }
+                return
+            }
+        }
+
         switch cmd {
         case "kill_switch":
             engageBlackholeKillSwitch(reason: "已手动触发黑洞熔断（官方 Claude 流量已彻底封锁）", sendPush: false)
@@ -123,7 +162,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         case "reverify":
             Task {
-                self.settings = self.storage.loadSettings()
                 await self.verifyAndActivateIfSafe(enrichGeo: true)
                 completionHandler?(self.encodeSnapshot())
             }
@@ -139,6 +177,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             snapshot.coreLogs = currentCoreLogs()
             completionHandler?(encodeSnapshot())
         }
+    }
+
+    private func applyLaunchPayload(_ payload: TunnelLaunchPayload) {
+        self.settings = payload.settings
+        self.currentSession = payload.session
+        self.currentNode = payload.node
+        snapshot.activeSessionId = payload.session?.id
+        snapshot.activeSessionName = payload.session?.name
+        snapshot.activeNodeName = payload.node.name
+        _ = applySingBoxMode(isBlackhole: true)
     }
 
     // MARK: - Fail-Closed Blackhole & Verification Logic
@@ -262,7 +310,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         watchdogTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { break }
-                self.settings = self.storage.loadSettings()
                 let sec = max(3, min(120, self.settings.watchdogIntervalSec))
                 try? await Task.sleep(nanoseconds: UInt64(sec) * 1_000_000_000)
                 if Task.isCancelled || self.snapshot.status != .protected { break }
@@ -311,10 +358,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func buildTunnelNetworkSettings() -> NEPacketTunnelNetworkSettings {
         let net = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
-        net.mtu = 8500
+        net.mtu = 4064
 
         let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.255"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
+        var excludedV4 = [
+            NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0")
+        ]
+        if !settings.globalMode {
+            excludedV4.append(contentsOf: [
+                NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"),
+                NEIPv4Route(destinationAddress: "172.16.0.0", subnetMask: "255.240.0.0"),
+                NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0")
+            ])
+        }
+        ipv4.excludedRoutes = excludedV4
         net.ipv4Settings = ipv4
 
         let ipv6 = NEIPv6Settings(addresses: ["fc00::1"], networkPrefixLengths: [128])

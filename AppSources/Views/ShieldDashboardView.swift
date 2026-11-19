@@ -64,6 +64,17 @@ struct ShieldDashboardView: View {
                 .foregroundStyle(VpnTheme.textSecondary)
                 .multilineTextAlignment(.center)
 
+            if let err = engine.lastDisconnectError, !err.isEmpty, engine.snapshot.status == .stopped {
+                Text(err)
+                    .font(.caption2)
+                    .foregroundStyle(VpnTheme.killRed)
+                    .multilineTextAlignment(.center)
+                    .padding(10)
+                    .frame(maxWidth: .infinity)
+                    .background(VpnTheme.killRedBg)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+
             if engine.snapshot.status == .protected {
                 Button {
                     if let url = URL(string: "claude://") {
