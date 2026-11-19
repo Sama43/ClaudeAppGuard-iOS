@@ -22,9 +22,6 @@
 
 ## GitHub 云端编译步骤（`macos-26`）
 
-```powershell
-cd C:\Users\wangleo\ClaudeAppGuard-iOS
-git remote add origin https://github.com/<你的用户名>/ClaudeAppGuard-iOS.git
-git push -u origin main
-```
-推送后在 GitHub 仓库的 **Actions** → `Build ClaudeAppGuard iOS IPA` 下载 `ClaudeAppGuard-iOS-v1.0.0-unsigned.ipa`。
+将源码推送到自己的 GitHub 仓库的 `main` 或 `master` 分支。工作流会自动构建，也可以在 **Actions** → **Build ClaudeAppGuard iOS IPA** 中手动触发。
+
+构建成功后下载 `ClaudeAppGuard-iOS-IPA` 构建产物，解压后获得无签名 IPA。

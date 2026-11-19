@@ -15,19 +15,44 @@ jobs:
       - name: Checkout ClaudeAppGuard-iOS
         uses: actions/checkout@v4
 
+      - name: Test subscription node refresh
+        run: |
+          xcrun swiftc \
+            Shared/VpnModels.swift \
+            AppSources/SubscriptionNodeMerge.swift \
+            Tests/SubscriptionNodeMergeTests.swift \
+            -o "$RUNNER_TEMP/subscription-node-merge-tests"
+          "$RUNNER_TEMP/subscription-node-merge-tests"
+
+      - name: Read Xcode cache key
+        id: xcode
+        shell: bash
+        run: |
+          printf 'version=%s\n' "$(xcodebuild -version | tr '\n' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Corebridge XCFramework
+        id: corebridge
+        uses: actions/cache@v4
+        with:
+          path: Frameworks/Corebridge.xcframework
+          key: corebridge-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('corebridge/**', '.github/workflows/build-ipa.yml') }}
+
       - name: Setup Go
+        if: steps.corebridge.outputs.cache-hit != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+          cache: false
 
-      - name: Install SagerNet gomobile & xcodegen
+      - name: Install SagerNet gomobile
+        if: steps.corebridge.outputs.cache-hit != 'true'
         run: |
           go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
           go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          brew install xcodegen
 
       - name: Build Corebridge.xcframework (sing-box v1.14.4 with gVisor TUN)
+        if: steps.corebridge.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v1.14.4 https://github.com/SagerNet/sing-box.git /tmp/sing-box
           mkdir -p /tmp/sing-box/corebridge
@@ -101,6 +126,7 @@ jobs:
 
       - name: Generate Xcode Project via XcodeGen
         run: |
+          brew install xcodegen
           xcodegen generate
 
       - name: Build Unsigned Release .app + PacketTunnel.appex for iOS arm64

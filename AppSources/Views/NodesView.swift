@@ -77,7 +77,7 @@ struct NodesView: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("\(sub.name) (\(sub.nodeCount)节点)").font(.subheadline.bold()).foregroundStyle(VpnTheme.textPrimary)
                                     if let total = sub.totalBytes, total > 0 {
-                                        let used = Double((sub.uploadBytes ?? 0) + (sub.downloadBytes ?? 0)) / 1_073_741_824.0
+                                        let used = (Double(sub.uploadBytes ?? 0) + Double(sub.downloadBytes ?? 0)) / 1_073_741_824.0
                                         Text(String(format: "已用 %.1fGB / %.1fGB", used, Double(total) / 1_073_741_824.0))
                                             .font(.caption2).foregroundStyle(VpnTheme.textSecondary)
                                     }
@@ -98,6 +98,7 @@ struct NodesView: View {
                                     if refreshingSubs.contains(sub.id) { ProgressView().scaleEffect(0.8) }
                                     else { Image(systemName: "arrow.clockwise").foregroundStyle(VpnTheme.shieldGreen) }
                                 }
+                                .disabled(refreshingSubs.contains(sub.id))
                                 Button { engine.deleteSubscription(sub.id) } label: {
                                     Image(systemName: "trash").foregroundStyle(VpnTheme.textSecondary)
                                 }.padding(.leading, 8)
@@ -179,9 +180,9 @@ struct NodesView: View {
                 }
             }
             .sheet(isPresented: $showImport) {
-                VpnImportSheet(initialTab: importTab, prefillUrl: prefillUrl, engine: engine) { ok, msg in
-                    banner = (ok, msg)
-                    if ok { showImport = false }
+                VpnImportSheet(initialTab: importTab, prefillUrl: prefillUrl, engine: engine) { message in
+                    banner = (true, message)
+                    showImport = false
                 }
             }
         }
@@ -201,7 +202,7 @@ private struct VpnImportSheet: View {
     let initialTab: Int
     let prefillUrl: String
     @ObservedObject var engine: VpnManagerEngine
-    let onFinish: (Bool, String) -> Void
+    let onFinish: (String) -> Void
     @Environment(\.dismiss) private var dismiss
 
     @State private var tab = 0
@@ -209,6 +210,7 @@ private struct VpnImportSheet: View {
     @State private var subUrl = ""
     @State private var rawText = ""
     @State private var loading = false
+    @State private var importError: String?
 
     var body: some View {
         NavigationStack {
@@ -227,28 +229,36 @@ private struct VpnImportSheet: View {
                         TextEditor(text: $rawText).frame(minHeight: 160).font(.caption.monospaced())
                     }
                 }
+                if let importError {
+                    Text(importError).foregroundStyle(VpnTheme.killRed)
+                }
             }
+            .interactiveDismissDisabled(loading)
             .navigationTitle("导入机场订阅 / 节点")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() }.disabled(loading) }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(loading ? "拉取中..." : "导入") {
+                        importError = nil
                         if tab == 0 {
                             loading = true
                             Task {
+                                defer { loading = false }
                                 do {
                                     let (s, c) = try await engine.addAndSyncSubscription(name: subName, url: subUrl, allowDirectBootstrap: true)
-                                    loading = false
-                                    onFinish(true, "已导入订阅「\(s.name)」共 \(c) 个节点")
+                                    onFinish("已导入订阅「\(s.name)」共 \(c) 个节点")
                                 } catch {
-                                    loading = false
-                                    onFinish(false, error.localizedDescription)
+                                    importError = error.localizedDescription
                                 }
                             }
                         } else {
                             let res = engine.importNodesFromText(rawText)
-                            onFinish(!res.nodes.isEmpty, res.nodes.isEmpty ? (res.errors.first ?? "解析失败") : "成功导入 \(res.nodes.count) 个节点")
+                            if res.nodes.isEmpty {
+                                importError = res.errors.first ?? "解析失败"
+                            } else {
+                                onFinish("成功导入 \(res.nodes.count) 个节点")
+                            }
                         }
                     }.disabled(loading)
                 }

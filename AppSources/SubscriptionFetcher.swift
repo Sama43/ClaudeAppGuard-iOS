@@ -18,8 +18,10 @@ enum SubscriptionFetcher {
         activeCorePort: Int?,
         allowDirectBootstrap: Bool
     ) async throws -> (SubscriptionFetchMeta, ParseBatchResult) {
-        guard let url = URL(string: urlString) else {
-            throw NSError(domain: "SubFetcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "无效的订阅 URL"])
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = url.host, !host.isEmpty else {
+            throw NSError(domain: "SubFetcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "请输入有效的 http:// 或 https:// 订阅链接"])
         }
 
         let useProxy = (activeCorePort ?? 0) > 0
@@ -39,12 +41,14 @@ enum SubscriptionFetcher {
 
         var lastError = "未知错误"
         for ua in userAgents {
+            try Task.checkCancellation()
             do {
                 var req = URLRequest(url: url)
                 req.setValue(ua, forHTTPHeaderField: "User-Agent")
                 req.setValue("*/*", forHTTPHeaderField: "Accept")
 
                 let (data, resp) = try await session.data(for: req)
+                try Task.checkCancellation()
                 guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
                     throw NSError(domain: "SubFetcher", code: code, userInfo: [NSLocalizedDescriptionKey: "HTTP \(code)"])
@@ -69,6 +73,7 @@ enum SubscriptionFetcher {
                 }
                 lastError = parsed.errors.first ?? "未解析到有效节点"
             } catch {
+                try Task.checkCancellation()
                 lastError = error.localizedDescription
             }
         }
@@ -82,7 +87,7 @@ enum SubscriptionFetcher {
         for part in header.split(separator: ";") {
             let kv = part.split(separator: "=", maxSplits: 1)
             if kv.count == 2,
-               let v = Int64(kv[1].trimmingCharacters(in: .whitespaces)) {
+               let v = Int64(kv[1].trimmingCharacters(in: .whitespaces)), v >= 0 {
                 out[kv[0].trimmingCharacters(in: .whitespaces).lowercased()] = v
             }
         }

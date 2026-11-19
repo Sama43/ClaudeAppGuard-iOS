@@ -49,6 +49,7 @@ final class VpnManagerEngine: ObservableObject {
     private var pendingAutoRetrySessionId: UUID? = nil
     private var lastAppliedSnapshotDate: Date = .distantPast
     private var currentControlToken: String = ""
+    private var refreshingSubscriptionIds = Set<UUID>()
 
     private let loopbackSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
@@ -487,11 +488,9 @@ final class VpnManagerEngine: ObservableObject {
 
     func addAndSyncSubscription(name: String, url: String, allowDirectBootstrap: Bool) async throws -> (SubscriptionProfile, Int) {
         let cleanUrl = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard cleanUrl.lowercased().hasPrefix("http://") || cleanUrl.lowercased().hasPrefix("https://") else {
-            throw NSError(domain: "Sub", code: 1, userInfo: [NSLocalizedDescriptionKey: "请输入 http:// 或 https:// 订阅链接"])
-        }
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let profile = SubscriptionProfile(
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "机场订阅" : name.trimmingCharacters(in: .whitespacesAndNewlines),
+            name: cleanName.isEmpty ? "机场订阅" : cleanName,
             url: cleanUrl,
             allowDirectBootstrap: allowDirectBootstrap
         )
@@ -502,6 +501,10 @@ final class VpnManagerEngine: ObservableObject {
         guard let existing = subscriptions.first(where: { $0.id == subId }) else {
             throw NSError(domain: "Sub", code: 2, userInfo: [NSLocalizedDescriptionKey: "未找到订阅"])
         }
+        guard refreshingSubscriptionIds.insert(subId).inserted else {
+            throw NSError(domain: "Sub", code: 3, userInfo: [NSLocalizedDescriptionKey: "该订阅正在刷新"])
+        }
+        defer { refreshingSubscriptionIds.remove(subId) }
         return try await syncSub(existing, isNew: false)
     }
 
@@ -509,11 +512,17 @@ final class VpnManagerEngine: ObservableObject {
         let (meta, batch) = try await SubscriptionFetcher.fetchAndParse(
             urlString: profile.url,
             activeCorePort: nil,
-            allowDirectBootstrap: true
+            allowDirectBootstrap: profile.allowDirectBootstrap
         )
-        let tagged = batch.nodes.map { n -> ProxyNode in
-            var c = n; c.subscriptionId = profile.id; return c
+        try Task.checkCancellation()
+        let subscriptionIndex = subscriptions.firstIndex(where: { $0.id == profile.id })
+        guard isNew || subscriptionIndex != nil else {
+            throw NSError(domain: "Sub", code: 4, userInfo: [NSLocalizedDescriptionKey: "该订阅已删除"])
         }
+        let existingNodes = nodes.filter { $0.subscriptionId == profile.id }
+        let tagged = SubscriptionNodeMerge.merge(batch.nodes, with: existingNodes, subscriptionId: profile.id)
+        let removedNodeIds = Set(existingNodes.map(\.id)).subtracting(tagged.map(\.id))
+        let affectedSessions = sessions.filter { removedNodeIds.contains($0.boundNodeId) }
         var updated = profile
         if updated.name == "机场订阅", let s = meta.suggestedName, !s.isEmpty { updated.name = s }
         updated.lastUpdated = Date()
@@ -523,15 +532,17 @@ final class VpnManagerEngine: ObservableObject {
         updated.totalBytes = meta.totalBytes ?? updated.totalBytes
         updated.expireTimestampSec = meta.expireTimestampSec ?? updated.expireTimestampSec
 
-        nodes.removeAll { $0.subscriptionId == profile.id }
-        nodes.append(contentsOf: tagged)
+        nodes = nodes.filter { $0.subscriptionId != profile.id } + tagged
         storage.saveNodes(nodes)
 
         if isNew { subscriptions.append(updated) }
-        else if let idx = subscriptions.firstIndex(where: { $0.id == profile.id }) { subscriptions[idx] = updated }
+        else if let subscriptionIndex { subscriptions[subscriptionIndex] = updated }
         storage.saveSubscriptions(subscriptions)
 
         recordLocalEvent(.success, tag: "SUB", "订阅「\(updated.name)」已更新 \(tagged.count) 个节点")
+        if !affectedSessions.isEmpty {
+            recordLocalEvent(.warn, tag: "SUB", "订阅更新后有 \(affectedSessions.count) 个身份的原节点已不存在，请重新绑定")
+        }
         return (updated, tagged.count)
     }
 
