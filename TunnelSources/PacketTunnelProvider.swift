@@ -8,7 +8,7 @@ import Corebridge
 /// iOS NEPacketTunnelProvider for Official Claude iOS App Isolation with Fail-Closed Blackhole Kill-Switch.
 ///
 /// Lifecycle:
-/// 1. Configures utun (IPv4 198.18.0.1/32 + 0.0.0.0/0, IPv6 fc00::1/128 + ::/0, DNS 198.18.0.2, MTU 8500).
+/// 1. Starts read-only loopback status mirror (127.0.0.1:49271) + configures utun (MTU 4064, DNS 198.18.0.2).
 /// 2. Immediately starts sing-box in BLACKHOLE MODE FIRST (all Claude domains -> action="reject") -> 0 startup leak!
 /// 3. Verifies Exit IP & Country strictly via local mixed-in (127.0.0.1:<probePort>).
 /// 4. ONLY on passing all region & IP-pin rules -> hot-swaps sing-box into PROTECTED MODE.
@@ -19,6 +19,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let storage = SharedStorage()
     private let pathMonitor = NWPathMonitor()
     private let pathQueue = DispatchQueue(label: "com.claudeguard.iosvpn.tunnel.path")
+    private let stateLock = NSLock()
 
     private var utunFd: Int32 = -1
     private var probePort: Int = 18088
@@ -28,10 +29,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var snapshot: TunnelSnapshot = TunnelSnapshot()
 
     private var watchdogTask: Task<Void, Never>?
+    private var verifyTask: Task<Void, Never>?
     private var lastInterface: NWInterface.InterfaceType?
     private var isBlackholeActive = true
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        _ = CorebridgeStartStatusServer(SharedConstants.statusMirrorPort)
+
         let payload = resolveLaunchPayload(options: options)
 
         let targetNode: ProxyNode
@@ -65,12 +69,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         self.currentSession = session
         self.currentNode = targetNode
         self.probePort = allocateLoopbackPort()
-        self.snapshot = TunnelSnapshot(
-            status: .startingCore,
-            activeSessionId: session?.id,
-            activeSessionName: session?.name,
-            activeNodeName: targetNode.name
-        )
+        withState {
+            self.snapshot = TunnelSnapshot(
+                status: .startingCore,
+                activeSessionId: session?.id,
+                activeSessionName: session?.name,
+                activeNodeName: targetNode.name
+            )
+        }
         recordEvent(.info, tag: "TUN", "正在建立 iOS 隔离隧道 -> \(targetNode.name) (\(targetNode.server):\(targetNode.port))")
 
         let netSettings = buildTunnelNetworkSettings()
@@ -110,9 +116,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.startPathMonitor()
 
             // Step 2: Verify Exit IP & Country strictly via probePort BEFORE opening Claude access!
-            Task {
-                await self.verifyAndActivateIfSafe(enrichGeo: true)
-            }
+            self.triggerVerification(enrichGeo: true)
         }
     }
 
@@ -132,24 +136,41 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         watchdogTask?.cancel()
+        verifyTask?.cancel()
         pathMonitor.cancel()
         CorebridgeStopTunnelCore()
-        snapshot.status = .stopped
-        snapshot.killSwitchReason = nil
+        withState {
+            snapshot.status = .stopped
+            snapshot.killSwitchReason = nil
+        }
         recordEvent(.info, tag: "TUN", "隔离 VPN 已停止")
+        CorebridgeStopStatusServer()
         completionHandler()
     }
 
+    /// Always replies IMMEDIATELY (< 1ms) so XPC sendProviderMessage NEVER blocks or times out.
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         let cmd = String(data: messageData, encoding: .utf8) ?? ""
         if cmd.hasPrefix("reload_payload:") {
             let b64 = String(cmd.dropFirst("reload_payload:".count))
             if let raw = Data(base64Encoded: b64),
                let payload = try? JSONDecoder().decode(TunnelLaunchPayload.self, from: raw) {
-                Task {
-                    self.applyLaunchPayload(payload)
-                    await self.verifyAndActivateIfSafe(enrichGeo: true)
-                    completionHandler?(self.encodeSnapshot())
+                withState {
+                    self.settings = payload.settings
+                    self.currentSession = payload.session
+                    self.currentNode = payload.node
+                    self.snapshot.status = .verifyingExit
+                    self.snapshot.activeSessionId = payload.session?.id
+                    self.snapshot.activeSessionName = payload.session?.name
+                    self.snapshot.activeNodeName = payload.node.name
+                    self.snapshot.killSwitchReason = nil
+                }
+                recordEvent(.info, tag: "IDENTITY", "正在切换隔离身份 -> \(payload.session?.name ?? payload.node.name)")
+                completionHandler?(encodeSnapshot())
+                Task.detached(priority: .userInitiated) { [weak self] in
+                    guard let self else { return }
+                    _ = self.applySingBoxMode(isBlackhole: true)
+                    self.triggerVerification(enrichGeo: true)
                 }
                 return
             }
@@ -161,32 +182,40 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?(encodeSnapshot())
 
         case "reverify":
-            Task {
-                await self.verifyAndActivateIfSafe(enrichGeo: true)
-                completionHandler?(self.encodeSnapshot())
+            withState {
+                self.snapshot.status = .verifyingExit
+                self.snapshot.killSwitchReason = nil
             }
+            persistSnapshot()
+            completionHandler?(encodeSnapshot())
+            triggerVerification(enrichGeo: true)
 
         case "reload":
-            Task {
+            withState {
+                self.snapshot.status = .verifyingExit
+            }
+            persistSnapshot()
+            completionHandler?(encodeSnapshot())
+            Task.detached(priority: .userInitiated) { [weak self] in
+                guard let self else { return }
                 self.reloadConfigFromStorage()
-                await self.verifyAndActivateIfSafe(enrichGeo: true)
-                completionHandler?(self.encodeSnapshot())
+                self.triggerVerification(enrichGeo: true)
             }
 
         default:
-            snapshot.coreLogs = currentCoreLogs()
+            withState {
+                snapshot.coreLogs = currentCoreLogs()
+            }
             completionHandler?(encodeSnapshot())
         }
     }
 
-    private func applyLaunchPayload(_ payload: TunnelLaunchPayload) {
-        self.settings = payload.settings
-        self.currentSession = payload.session
-        self.currentNode = payload.node
-        snapshot.activeSessionId = payload.session?.id
-        snapshot.activeSessionName = payload.session?.name
-        snapshot.activeNodeName = payload.node.name
-        _ = applySingBoxMode(isBlackhole: true)
+    private func triggerVerification(enrichGeo: Bool) {
+        verifyTask?.cancel()
+        verifyTask = Task { [weak self] in
+            guard let self else { return }
+            await self.verifyAndActivateIfSafe(enrichGeo: enrichGeo)
+        }
     }
 
     // MARK: - Fail-Closed Blackhole & Verification Logic
@@ -200,9 +229,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         self.currentSession = sess
         if let s = sess, let n = nodes.first(where: { $0.id == s.boundNodeId }) {
             self.currentNode = n
-            snapshot.activeSessionId = s.id
-            snapshot.activeSessionName = s.name
-            snapshot.activeNodeName = n.name
+            withState {
+                snapshot.activeSessionId = s.id
+                snapshot.activeSessionName = s.name
+                snapshot.activeNodeName = n.name
+            }
         }
         _ = applySingBoxMode(isBlackhole: true)
     }
@@ -222,7 +253,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return err
             }
             self.isBlackholeActive = isBlackhole
-            snapshot.coreLogs = currentCoreLogs()
+            withState {
+                snapshot.coreLogs = currentCoreLogs()
+            }
+            persistSnapshot()
             return nil
         } catch {
             return error.localizedDescription
@@ -230,9 +264,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func verifyAndActivateIfSafe(enrichGeo: Bool) async {
-        snapshot.status = .verifyingExit
-        snapshot.killSwitchReason = nil
-        persistSnapshot()
+        withState {
+            snapshot.status = .verifyingExit
+            snapshot.killSwitchReason = nil
+        }
+        recordEvent(.info, tag: "VERIFY", "黑洞锁定下正在通过节点校验海外出口 IP...")
 
         // Ensure core is running (if currently stopped, start in Blackhole mode to probe)
         if !CorebridgeIsRunning() {
@@ -242,17 +278,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        try? await Task.sleep(nanoseconds: 250_000_000)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        if Task.isCancelled { return }
+
         let check = await ExitIpVerifier.verify(corePort: probePort, enrichGeo: enrichGeo, timeoutSec: enrichGeo ? 8 : 4)
+        if Task.isCancelled { return }
+
         guard check.success, let ip = check.exitIp, let cc = check.countryCode else {
             engageBlackholeKillSwitch(reason: "代理链路中断或超时：\(check.error ?? "无响应")（已切入黑洞封锁官方 Claude，零直连）", sendPush: true)
             return
         }
 
         if let violation = evaluatePolicyViolation(exitIp: ip, countryCode: cc) {
-            snapshot.exitIp = ip
-            snapshot.exitCountry = cc
-            snapshot.latencyMs = check.latencyMs
+            withState {
+                snapshot.exitIp = ip
+                snapshot.exitCountry = cc
+                snapshot.latencyMs = check.latencyMs
+            }
             engageBlackholeKillSwitch(reason: violation, sendPush: true)
             return
         }
@@ -265,13 +307,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        snapshot.status = .protected
-        snapshot.exitIp = ip
-        snapshot.exitCountry = cc
-        snapshot.exitCity = check.city ?? snapshot.exitCity
-        snapshot.exitOrg = check.org ?? snapshot.exitOrg
-        snapshot.latencyMs = check.latencyMs
-        snapshot.killSwitchReason = nil
+        withState {
+            snapshot.status = .protected
+            snapshot.exitIp = ip
+            snapshot.exitCountry = cc
+            snapshot.exitCity = check.city ?? snapshot.exitCity
+            snapshot.exitOrg = check.org ?? snapshot.exitOrg
+            snapshot.latencyMs = check.latencyMs
+            snapshot.killSwitchReason = nil
+        }
         recordEvent(.success, tag: "PROTECTED", "出口校验通过 -> \(cc) · \(ip) (\(check.latencyMs ?? 0)ms)")
 
         startWatchdogLoop()
@@ -280,8 +324,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func engageBlackholeKillSwitch(reason: String, sendPush: Bool) {
         watchdogTask?.cancel()
         _ = applySingBoxMode(isBlackhole: true)
-        snapshot.status = .blackholeKillSwitch
-        snapshot.killSwitchReason = reason
+        withState {
+            snapshot.status = .blackholeKillSwitch
+            snapshot.killSwitchReason = reason
+        }
         recordEvent(.critical, tag: "KILL_SWITCH", reason)
         if sendPush {
             postKillSwitchNotification(reason: reason)
@@ -312,7 +358,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 guard let self else { break }
                 let sec = max(3, min(120, self.settings.watchdogIntervalSec))
                 try? await Task.sleep(nanoseconds: UInt64(sec) * 1_000_000_000)
-                if Task.isCancelled || self.snapshot.status != .protected { break }
+                if Task.isCancelled { break }
+                let currentStatus = self.withState { self.snapshot.status }
+                if currentStatus != .protected { break }
                 if !CorebridgeIsRunning() {
                     self.engageBlackholeKillSwitch(reason: "后台巡检发现代理内核停止，已切入黑洞熔断", sendPush: true)
                     break
@@ -326,9 +374,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.engageBlackholeKillSwitch(reason: violation, sendPush: true)
                     break
                 }
-                self.snapshot.exitIp = ip
-                self.snapshot.exitCountry = cc
-                self.snapshot.latencyMs = check.latencyMs
+                self.withState {
+                    self.snapshot.exitIp = ip
+                    self.snapshot.exitCountry = cc
+                    self.snapshot.latencyMs = check.latencyMs
+                }
                 self.persistSnapshot()
             }
         }
@@ -341,16 +391,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let prev = self.lastInterface
             self.lastInterface = cur
 
+            let currentStatus = self.withState { self.snapshot.status }
             if path.status != .satisfied {
-                if self.snapshot.status == .protected {
+                if currentStatus == .protected {
                     self.engageBlackholeKillSwitch(reason: "检测到物理网络断开！已瞬时黑洞封锁官方 Claude，零直连", sendPush: true)
                 }
                 return
             }
 
-            if let prev, let cur, prev != cur, self.settings.killOnNetworkChange, self.snapshot.status == .protected {
+            if let prev, let cur, prev != cur, self.settings.killOnNetworkChange, currentStatus == .protected {
                 self.engageBlackholeKillSwitch(reason: "检测到 Wi-Fi/蜂窝切换，正在黑洞保护下重新校验出口...", sendPush: false)
-                Task { await self.verifyAndActivateIfSafe(enrichGeo: true) }
+                self.triggerVerification(enrichGeo: true)
             }
         }
         pathMonitor.start(queue: pathQueue)
@@ -394,22 +445,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         UNUserNotificationCenter.current().add(req)
     }
 
+    @discardableResult
+    private func withState<T>(_ body: () -> T) -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return body()
+    }
+
     private func recordEvent(_ level: EventLevel, tag: String, _ message: String) {
-        snapshot.recentEvents.insert(SecurityEvent(level: level, tag: tag, message: message), at: 0)
-        if snapshot.recentEvents.count > 100 {
-            snapshot.recentEvents = Array(snapshot.recentEvents.prefix(100))
+        withState {
+            snapshot.recentEvents.insert(SecurityEvent(level: level, tag: tag, message: message), at: 0)
+            if snapshot.recentEvents.count > 100 {
+                snapshot.recentEvents = Array(snapshot.recentEvents.prefix(100))
+            }
+            snapshot.coreLogs = currentCoreLogs()
         }
-        snapshot.coreLogs = currentCoreLogs()
         persistSnapshot()
     }
 
     private func persistSnapshot() {
-        snapshot.updatedAt = Date()
-        storage.saveSnapshot(snapshot)
+        let snapCopy: TunnelSnapshot = withState {
+            snapshot.updatedAt = Date()
+            return snapshot
+        }
+        storage.saveSnapshot(snapCopy)
+        if let data = try? JSONEncoder().encode(snapCopy),
+           let jsonStr = String(data: data, encoding: .utf8) {
+            CorebridgeUpdateStatusJSON(jsonStr)
+        }
     }
 
     private func encodeSnapshot() -> Data? {
-        try? JSONEncoder().encode(snapshot)
+        let snapCopy: TunnelSnapshot = withState { snapshot }
+        return try? JSONEncoder().encode(snapCopy)
     }
 
     private func currentCoreLogs() -> [String] {

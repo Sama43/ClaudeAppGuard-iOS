@@ -3,8 +3,11 @@ package corebridge
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"net/netip"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -15,8 +18,8 @@ import (
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
 	tun "github.com/sagernet/sing-tun"
-	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/service"
 	"golang.org/x/sys/unix"
 )
@@ -24,16 +27,20 @@ import (
 func init() {
 	// Keep Go runtime safely inside iOS NEPacketTunnelProvider's 50 MB RAM limit
 	debug.SetGCPercent(20)
-	debug.SetMemoryLimit(28 * 1024 * 1024)
+	debug.SetMemoryLimit(26 * 1024 * 1024)
 }
 
 var (
-	mu          sync.Mutex
-	activeBox   *box.Box
-	tempBoxes   = make(map[string]*box.Box)
-	tempCounter int64
-	logMu       sync.Mutex
-	logLines    []string
+	mu           sync.Mutex
+	activeBox    *box.Box
+	tempBoxes    = make(map[string]*box.Box)
+	tempCounter  int64
+	logMu        sync.Mutex
+	logLines     []string
+	statusMu     sync.RWMutex
+	statusJSON   string
+	statusServer *http.Server
+	statusLn     net.Listener
 )
 
 func appendLog(msg string) {
@@ -44,6 +51,73 @@ func appendLog(msg string) {
 	if len(logLines) > 120 {
 		logLines = logLines[len(logLines)-120:]
 	}
+}
+
+// StartStatusServer starts a read-only loopback HTTP server (127.0.0.1:<port>) that mirrors
+// PacketTunnel's latest TunnelSnapshot JSON for the containing app when App Group / XPC is unavailable.
+func StartStatusServer(port int32) string {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+
+	if statusServer != nil {
+		_ = statusServer.Close()
+		statusServer = nil
+	}
+	if statusLn != nil {
+		_ = statusLn.Close()
+		statusLn = nil
+	}
+
+	ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		appendLog("status server listen err: " + err.Error())
+		return err.Error()
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		statusMu.RLock()
+		body := statusJSON
+		statusMu.RUnlock()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if body == "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	})
+
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+	statusLn = ln
+	statusServer = srv
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	appendLog(fmt.Sprintf("status mirror ready on 127.0.0.1:%d", port))
+	return ""
+}
+
+func StopStatusServer() {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	if statusServer != nil {
+		_ = statusServer.Close()
+		statusServer = nil
+	}
+	if statusLn != nil {
+		_ = statusLn.Close()
+		statusLn = nil
+	}
+}
+
+func UpdateStatusJSON(payload string) {
+	statusMu.Lock()
+	statusJSON = payload
+	statusMu.Unlock()
 }
 
 // FindUtunFileDescriptor scans open fds for iOS NEPacketTunnelProvider's com.apple.net.utun_control socket.
@@ -101,6 +175,7 @@ func (p *iosTunPlatform) OpenInterface(options *tun.Options, platformOptions opt
 		return nil, fmt.Errorf("dup utun fd: %w", err)
 	}
 	options.FileDescriptor = dupFd
+	appendLog(fmt.Sprintf("utun opened: name=%s fd=%d->dup=%d mtu=%d", options.Name, p.tunFd, dupFd, options.MTU))
 
 	addrs := make([]netip.Addr, 0, len(options.Inet4Address)+len(options.Inet6Address))
 	for _, pref := range options.Inet4Address {
@@ -180,8 +255,11 @@ func StartTunnelCore(configJSON string, tunFd int32) string {
 	defer mu.Unlock()
 
 	if activeBox != nil {
+		appendLog("closing previous sing-box instance")
 		_ = activeBox.Close()
 		activeBox = nil
+		runtime.GC()
+		debug.FreeOSMemory()
 	}
 
 	instance, err := startInstance(configJSON, tunFd)
@@ -190,7 +268,7 @@ func StartTunnelCore(configJSON string, tunFd int32) string {
 		return err.Error()
 	}
 	activeBox = instance
-	appendLog(fmt.Sprintf("sing-box 1.14.4 started (tunFd=%d)", tunFd))
+	appendLog(fmt.Sprintf("sing-box 1.14.4 started OK (tunFd=%d)", tunFd))
 	return ""
 }
 
@@ -200,6 +278,8 @@ func StopTunnelCore() {
 	if activeBox != nil {
 		_ = activeBox.Close()
 		activeBox = nil
+		runtime.GC()
+		debug.FreeOSMemory()
 		appendLog("sing-box stopped")
 	}
 }

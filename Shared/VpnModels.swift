@@ -3,6 +3,7 @@ import Foundation
 enum SharedConstants {
     static let appGroupId = "group.com.claudeguard.iosvpn"
     static let defaultTunnelBundleId = "com.claudeguard.iosvpn.PacketTunnel"
+    static let statusMirrorPort: Int32 = 49271
 
     /// Dynamically discovers the embedded PacketTunnel .appex bundle ID so re-signing with a custom Bundle ID works seamlessly.
     static func resolvedTunnelBundleId() -> String {

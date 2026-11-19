@@ -46,6 +46,17 @@ final class VpnManagerEngine: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var startupWatchTask: Task<Void, Never>?
     private var userRequestedStop = false
+    private var pendingAutoRetrySessionId: UUID? = nil
+    private var loggedIpcWarning = false
+    private var lastAppliedSnapshotDate: Date = .distantPast
+
+    private let loopbackSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 1.5
+        cfg.timeoutIntervalForResource = 2.0
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: cfg)
+    }()
 
     init() {
         self.nodes = storage.loadNodes()
@@ -79,6 +90,7 @@ final class VpnManagerEngine: ObservableObject {
                     self.observeVpnStatus(existing)
                     if existing.connection.status == .connected {
                         self.sendTunnelCommand("status")
+                        Task { await self.pollLoopbackMirror() }
                     } else {
                         self.snapshot.status = .stopped
                     }
@@ -117,8 +129,16 @@ final class VpnManagerEngine: ObservableObject {
                 switch newStatus {
                 case .connected:
                     self.startupWatchTask?.cancel()
+                    self.pendingAutoRetrySessionId = nil
                     self.lastDisconnectError = nil
-                    self.sendTunnelCommand("status")
+                    self.loggedIpcWarning = false
+                    // Let extension finish post-connect setup before first IPC query
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        guard let self, self.vpnStatus == .connected else { return }
+                        self.sendTunnelCommand("status")
+                        await self.pollLoopbackMirror()
+                    }
 
                 case .disconnected, .invalid:
                     self.startupWatchTask?.cancel()
@@ -128,10 +148,8 @@ final class VpnManagerEngine: ObservableObject {
                     }
                     self.userRequestedStop = false
 
-                case .connecting, .reasserting:
-                    self.sendTunnelCommand("status")
-
                 default:
+                    // IMPORTANT: Never call sendProviderMessage while .connecting (prevents neagent code=12 race!)
                     break
                 }
             }
@@ -145,6 +163,17 @@ final class VpnManagerEngine: ObservableObject {
                 if let err {
                     let nsErr = err as NSError
                     let msg = "\(nsErr.localizedDescription) (domain=\(nsErr.domain), code=\(nsErr.code))"
+                    // Auto-retry ONCE on initial iOS neagent code=12 (profile registration race right after saveToPreferences)
+                    if nsErr.domain == NEVPNConnectionErrorDomain && nsErr.code == 12,
+                       let retrySid = self.pendingAutoRetrySessionId {
+                        self.pendingAutoRetrySessionId = nil
+                        self.recordLocalEvent(.warn, tag: "VPN", "首次拉起遇到系统 code=12，0.6 秒后自动重试...")
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: 600_000_000)
+                            self?.startProtection(forSessionId: retrySid, allowAutoRetry: false)
+                        }
+                        return
+                    }
                     self.lastDisconnectError = msg
                     self.recordLocalEvent(.critical, tag: "VPN", "PacketTunnel 启动/断开报错: \(msg)")
                 }
@@ -156,24 +185,38 @@ final class VpnManagerEngine: ObservableObject {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
                 guard let self else { break }
-                if self.vpnStatus == .connected || self.vpnStatus == .connecting {
+                if self.vpnStatus == .connected {
                     self.sendTunnelCommand("status")
-                } else if self.appGroupAvailable && self.snapshot.status == .stopped {
-                    // Only load cached snapshot when stopped if App Group is active
-                    let cached = self.storage.loadSnapshot()
-                    if cached.status == .stopped && !cached.recentEvents.isEmpty {
-                        self.snapshot.recentEvents = cached.recentEvents
-                    }
+                    await self.pollLoopbackMirror()
                 }
             }
         }
     }
 
+    private func pollLoopbackMirror() async {
+        guard let url = URL(string: "http://127.0.0.1:\(SharedConstants.statusMirrorPort)/snapshot") else { return }
+        do {
+            let (data, resp) = try await loopbackSession.data(from: url)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200, !data.isEmpty else { return }
+            let snap = try JSONDecoder().decode(TunnelSnapshot.self, from: data)
+            applyIncomingSnapshot(snap)
+        } catch {
+            // Mirror may still be booting; keep silent
+        }
+    }
+
+    private func applyIncomingSnapshot(_ snap: TunnelSnapshot) {
+        if snap.updatedAt >= lastAppliedSnapshotDate || snap.status != snapshot.status || snap.recentEvents.count != snapshot.recentEvents.count {
+            lastAppliedSnapshotDate = snap.updatedAt
+            self.snapshot = snap
+        }
+    }
+
     // MARK: - VPN Control
 
-    func startProtection(forSessionId sessionId: UUID) {
+    func startProtection(forSessionId sessionId: UUID, allowAutoRetry: Bool = true) {
         guard let session = sessions.first(where: { $0.id == sessionId }),
               let node = nodes.first(where: { $0.id == session.boundNodeId }) else {
             recordLocalEvent(.warn, tag: "VPN", "该身份未绑定有效节点")
@@ -182,6 +225,8 @@ final class VpnManagerEngine: ObservableObject {
 
         userRequestedStop = false
         lastDisconnectError = nil
+        loggedIpcWarning = false
+        pendingAutoRetrySessionId = allowAutoRetry ? sessionId : nil
         activeSessionId = session.id
         storage.saveActiveSessionId(session.id)
         if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
@@ -207,6 +252,7 @@ final class VpnManagerEngine: ObservableObject {
             return
         }
 
+        lastAppliedSnapshotDate = .distantPast
         snapshot.status = .startingCore
         snapshot.activeSessionId = session.id
         snapshot.activeSessionName = session.name
@@ -221,7 +267,7 @@ final class VpnManagerEngine: ObservableObject {
         mgr.localizedDescription = "ClaudeAppGuard 官方客户端隔离"
         mgr.isEnabled = true
 
-        recordLocalEvent(.info, tag: "VPN", "准备拉起扩展 [\(resolvedExtensionId)] -> 节点 \(node.name) (AppGroup=\(appGroupAvailable ? "可用" : "降级IPC直传"))")
+        recordLocalEvent(.info, tag: "VPN", "准备拉起扩展 [\(resolvedExtensionId)] -> 节点 \(node.name) (AppGroup=\(appGroupAvailable ? "可用" : "降级IPC+环回直传"))")
 
         mgr.saveToPreferences { [weak self] err in
             Task { @MainActor [weak self] in
@@ -241,6 +287,8 @@ final class VpnManagerEngine: ObservableObject {
                             self.recordLocalEvent(.critical, tag: "VPN", "加载 VPN 配置失败: \(loadErr.localizedDescription)")
                             return
                         }
+                        // Brief settle delay after save/load avoids iOS neagent first-launch code=12 race
+                        try? await Task.sleep(nanoseconds: 250_000_000)
                         do {
                             try (mgr.connection as? NETunnelProviderSession)?.startTunnel(
                                 options: ["payload": payloadData as NSData]
@@ -265,7 +313,7 @@ final class VpnManagerEngine: ObservableObject {
             guard !Task.isCancelled, let self else { return }
             if self.vpnStatus != .connected {
                 self.fetchDisconnectReason(from: mgr)
-                let msg = "等待系统拉起 PacketTunnel 超时（当前系统状态: \(self.vpnStatusText)）。常见原因：重签工具未给 PacketTunnel 扩展正确签入 NetworkExtension 描述文件，或证书不含 VPN 权限。"
+                let msg = "等待系统拉起 PacketTunnel 超时（当前系统状态: \(self.vpnStatusText)）。请检查证书是否包含 NetworkExtension 权限。"
                 if self.lastDisconnectError == nil {
                     self.lastDisconnectError = msg
                 }
@@ -297,6 +345,7 @@ final class VpnManagerEngine: ObservableObject {
 
     func stopVpnCompletely() {
         userRequestedStop = true
+        pendingAutoRetrySessionId = nil
         startupWatchTask?.cancel()
         manager?.connection.stopVPNTunnel()
         snapshot.status = .stopped
@@ -320,12 +369,35 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     private func sendTunnelCommand(_ cmd: String) {
-        guard let session = manager?.connection as? NETunnelProviderSession,
+        guard vpnStatus == .connected,
+              let session = manager?.connection as? NETunnelProviderSession,
               let data = cmd.data(using: .utf8) else { return }
-        try? session.sendProviderMessage(data) { [weak self] respData in
-            guard let respData, let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: respData) else { return }
-            Task { @MainActor [weak self] in
-                self?.snapshot = snap
+        do {
+            try session.sendProviderMessage(data) { [weak self] respData in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard let respData else {
+                        if !self.loggedIpcWarning {
+                            self.loggedIpcWarning = true
+                            self.recordLocalEvent(.warn, tag: "IPC", "XPC sendProviderMessage 返回空，已自动使用 127.0.0.1 状态镜像同步")
+                        }
+                        return
+                    }
+                    do {
+                        let snap = try JSONDecoder().decode(TunnelSnapshot.self, from: respData)
+                        self.applyIncomingSnapshot(snap)
+                    } catch {
+                        if !self.loggedIpcWarning {
+                            self.loggedIpcWarning = true
+                            self.recordLocalEvent(.warn, tag: "IPC", "解析扩展状态失败: \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+        } catch {
+            if !loggedIpcWarning {
+                loggedIpcWarning = true
+                recordLocalEvent(.warn, tag: "IPC", "sendProviderMessage 报错: \(error.localizedDescription)（自动使用环回状态镜像）")
             }
         }
     }
