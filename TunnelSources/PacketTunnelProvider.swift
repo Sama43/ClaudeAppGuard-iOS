@@ -10,9 +10,9 @@ private final class TunnelCmdBridge: NSObject, CorebridgeCommandHandlerProtocol 
     init(owner: PacketTunnelProvider) {
         self.owner = owner
     }
-    func onControlCommand(_ cmd: String?) {
-        guard let cmd, !cmd.isEmpty else { return }
-        owner?.processControlCommand(cmd)
+    func onControlCommand(_ commandText: String?) {
+        guard let commandText, !commandText.isEmpty else { return }
+        owner?.processControlCommand(commandText)
     }
 }
 

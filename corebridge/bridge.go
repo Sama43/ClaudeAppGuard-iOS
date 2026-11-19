@@ -36,7 +36,7 @@ func init() {
 // CommandHandler receives authenticated local control commands (kill_switch / reverify / reload_payload)
 // from the containing app over loopback HTTP when Apple XPC sendProviderMessage is unavailable.
 type CommandHandler interface {
-	OnControlCommand(cmd string)
+	OnControlCommand(commandText string)
 }
 
 var (
