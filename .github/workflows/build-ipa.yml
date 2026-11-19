@@ -105,6 +105,8 @@ jobs:
 
       - name: Build Unsigned Release .app + PacketTunnel.appex for iOS arm64
         run: |
+          mkdir -p build
+          set +e
           xcodebuild build \
             -project ClaudeAppGuard.xcodeproj \
             -scheme ClaudeAppGuard \
@@ -114,7 +116,15 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM=""
+            DEVELOPMENT_TEAM="" 2>&1 | tee build/xcodebuild.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "================ LINKER / COMPILER ERROR SUMMARY ================"
+            grep -n -C 3 -E "(ld:|error:|Undefined symbols|framework not found|library not found|duplicate symbol|not safe for use in application extensions)" build/xcodebuild.log | tail -n 100 || true
+            echo "================================================================="
+            exit "$STATUS"
+          fi
 
       - name: Package .ipa
         run: |
