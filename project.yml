@@ -38,7 +38,6 @@ targets:
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-ObjC"
-          - "-lresolv"
           - "-framework"
           - "Security"
           - "-framework"
@@ -47,6 +46,8 @@ targets:
           - "SystemConfiguration"
           - "-framework"
           - "CFNetwork"
+          - "-framework"
+          - "UIKit"
     dependencies:
       - target: PacketTunnel
         embed: true
@@ -56,6 +57,7 @@ targets:
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
       - sdk: UserNotifications.framework
+      - sdk: UIKit.framework
       - sdk: Security.framework
       - sdk: CoreFoundation.framework
       - sdk: SystemConfiguration.framework
@@ -95,7 +97,6 @@ targets:
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-ObjC"
-          - "-lresolv"
           - "-framework"
           - "Security"
           - "-framework"
@@ -104,12 +105,15 @@ targets:
           - "SystemConfiguration"
           - "-framework"
           - "CFNetwork"
+          - "-framework"
+          - "UIKit"
     dependencies:
       - framework: Frameworks/Corebridge.xcframework
         embed: false
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
       - sdk: UserNotifications.framework
+      - sdk: UIKit.framework
       - sdk: Security.framework
       - sdk: CoreFoundation.framework
       - sdk: SystemConfiguration.framework
