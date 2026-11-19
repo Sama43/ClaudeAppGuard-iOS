@@ -131,17 +131,17 @@ jobs:
           mkdir -p build/ipa/Payload
           cp -R build/DerivedData/Build/Products/Release-iphoneos/ClaudeAppGuard.app build/ipa/Payload/
           cd build/ipa
-          zip -qry "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v1.0.2-unsigned.ipa" Payload
-          ls -lh "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v1.0.2-unsigned.ipa"
+          zip -qry "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa" Payload
+          ls -lh "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa"
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ClaudeAppGuard-iOS-IPA
-          path: ClaudeAppGuard-iOS-v1.0.2-unsigned.ipa
+          path: ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa
 
       - name: Publish GitHub Release on Tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ClaudeAppGuard-iOS-v1.0.2-unsigned.ipa
+          files: ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa

@@ -2,7 +2,9 @@ package corebridge
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -16,6 +18,7 @@ import (
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/include"
+	boxlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/json"
@@ -28,6 +31,12 @@ func init() {
 	// Keep Go runtime safely inside iOS NEPacketTunnelProvider's 50 MB RAM limit
 	debug.SetGCPercent(20)
 	debug.SetMemoryLimit(26 * 1024 * 1024)
+}
+
+// CommandHandler receives authenticated local control commands (kill_switch / reverify / reload_payload)
+// from the containing app over loopback HTTP when Apple XPC sendProviderMessage is unavailable.
+type CommandHandler interface {
+	OnControlCommand(cmd string)
 }
 
 var (
@@ -44,18 +53,30 @@ var (
 )
 
 func appendLog(msg string) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
 	logMu.Lock()
 	defer logMu.Unlock()
 	ts := time.Now().Format("15:04:05")
 	logLines = append(logLines, fmt.Sprintf("%s %s", ts, msg))
-	if len(logLines) > 120 {
-		logLines = logLines[len(logLines)-120:]
+	if len(logLines) > 200 {
+		logLines = logLines[len(logLines)-200:]
 	}
 }
 
-// StartStatusServer starts a read-only loopback HTTP server (127.0.0.1:<port>) that mirrors
-// PacketTunnel's latest TunnelSnapshot JSON for the containing app when App Group / XPC is unavailable.
-func StartStatusServer(port int32) string {
+type bridgeLogWriter struct{}
+
+func (w *bridgeLogWriter) DisableColors() bool { return true }
+func (w *bridgeLogWriter) WriteMessage(level boxlog.Level, message string) {
+	appendLog(message)
+}
+
+// StartStatusServer starts a loopback HTTP server (127.0.0.1:<port>):
+// - GET /snapshot: read-only mirror of PacketTunnel's latest TunnelSnapshot JSON
+// - POST /cmd: authenticated control endpoint (requires X-CG-Token == controlToken)
+func StartStatusServer(port int32, controlToken string, handler CommandHandler) string {
 	statusMu.Lock()
 	defer statusMu.Unlock()
 
@@ -74,6 +95,7 @@ func StartStatusServer(port int32) string {
 		return err.Error()
 	}
 
+	tokenBytes := []byte(controlToken)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		statusMu.RLock()
@@ -88,6 +110,35 @@ func StartStatusServer(port int32) string {
 		_, _ = w.Write([]byte(body))
 	})
 
+	mux.HandleFunc("/cmd", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		got := []byte(r.Header.Get("X-CG-Token"))
+		if len(tokenBytes) < 16 || subtle.ConstantTimeCompare(got, tokenBytes) != 1 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		cmd := string(raw)
+		if handler != nil && cmd != "" {
+			go handler.OnControlCommand(cmd)
+		}
+		statusMu.RLock()
+		body := statusJSON
+		statusMu.RUnlock()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if body != "" {
+			_, _ = w.Write([]byte(body))
+		}
+	})
+
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
@@ -97,7 +148,7 @@ func StartStatusServer(port int32) string {
 	go func() {
 		_ = srv.Serve(ln)
 	}()
-	appendLog(fmt.Sprintf("status mirror ready on 127.0.0.1:%d", port))
+	appendLog(fmt.Sprintf("status+control mirror ready on 127.0.0.1:%d", port))
 	return ""
 }
 
@@ -226,7 +277,7 @@ func (p *iosTunPlatform) CreateBridge(opts adapter.BridgeOptions) (adapter.Bridg
 	return nil, os.ErrInvalid
 }
 
-func startInstance(configJSON string, tunFd int32) (*box.Box, error) {
+func startInstance(configJSON string, tunFd int32, captureLogs bool) (*box.Box, error) {
 	ctx := include.Context(context.Background())
 	if tunFd >= 0 {
 		service.MustRegister[adapter.PlatformInterface](ctx, &iosTunPlatform{tunFd: tunFd})
@@ -235,10 +286,14 @@ func startInstance(configJSON string, tunFd int32) (*box.Box, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
-	instance, err := box.New(box.Options{
+	boxOpts := box.Options{
 		Context: ctx,
 		Options: options,
-	})
+	}
+	if captureLogs {
+		boxOpts.PlatformLogWriter = &bridgeLogWriter{}
+	}
+	instance, err := box.New(boxOpts)
 	if err != nil {
 		return nil, fmt.Errorf("create sing-box: %w", err)
 	}
@@ -262,7 +317,7 @@ func StartTunnelCore(configJSON string, tunFd int32) string {
 		debug.FreeOSMemory()
 	}
 
-	instance, err := startInstance(configJSON, tunFd)
+	instance, err := startInstance(configJSON, tunFd, true)
 	if err != nil {
 		appendLog("ERROR: " + err.Error())
 		return err.Error()
@@ -292,7 +347,7 @@ func IsRunning() bool {
 
 // StartTempCore starts an isolated non-TUN sing-box instance for node testing. Returns "OK:<id>" or "ERR:<msg>".
 func StartTempCore(configJSON string) string {
-	instance, err := startInstance(configJSON, -1)
+	instance, err := startInstance(configJSON, -1, false)
 	if err != nil {
 		return "ERR:" + err.Error()
 	}

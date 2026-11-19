@@ -47,8 +47,8 @@ final class VpnManagerEngine: ObservableObject {
     private var startupWatchTask: Task<Void, Never>?
     private var userRequestedStop = false
     private var pendingAutoRetrySessionId: UUID? = nil
-    private var loggedIpcWarning = false
     private var lastAppliedSnapshotDate: Date = .distantPast
+    private var currentControlToken: String = ""
 
     private let loopbackSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
@@ -87,9 +87,14 @@ final class VpnManagerEngine: ObservableObject {
                 }) ?? managers?.first {
                     self.manager = existing
                     self.vpnStatus = existing.connection.status
+                    if let proto = existing.protocolConfiguration as? NETunnelProviderProtocol,
+                       let raw = proto.providerConfiguration?["payload"] as? Data,
+                       let decoded = try? JSONDecoder().decode(TunnelLaunchPayload.self, from: raw),
+                       !decoded.controlToken.isEmpty {
+                        self.currentControlToken = decoded.controlToken
+                    }
                     self.observeVpnStatus(existing)
                     if existing.connection.status == .connected {
-                        self.sendTunnelCommand("status")
                         Task { await self.pollLoopbackMirror() }
                     } else {
                         self.snapshot.status = .stopped
@@ -131,12 +136,9 @@ final class VpnManagerEngine: ObservableObject {
                     self.startupWatchTask?.cancel()
                     self.pendingAutoRetrySessionId = nil
                     self.lastDisconnectError = nil
-                    self.loggedIpcWarning = false
-                    // Let extension finish post-connect setup before first IPC query
                     Task { @MainActor [weak self] in
                         try? await Task.sleep(nanoseconds: 350_000_000)
                         guard let self, self.vpnStatus == .connected else { return }
-                        self.sendTunnelCommand("status")
                         await self.pollLoopbackMirror()
                     }
 
@@ -188,7 +190,6 @@ final class VpnManagerEngine: ObservableObject {
                 try? await Task.sleep(nanoseconds: 1_200_000_000)
                 guard let self else { break }
                 if self.vpnStatus == .connected {
-                    self.sendTunnelCommand("status")
                     await self.pollLoopbackMirror()
                 }
             }
@@ -225,7 +226,6 @@ final class VpnManagerEngine: ObservableObject {
 
         userRequestedStop = false
         lastDisconnectError = nil
-        loggedIpcWarning = false
         pendingAutoRetrySessionId = allowAutoRetry ? sessionId : nil
         activeSessionId = session.id
         storage.saveActiveSessionId(session.id)
@@ -234,15 +234,20 @@ final class VpnManagerEngine: ObservableObject {
             storage.saveSessions(sessions)
         }
 
-        let payload = TunnelLaunchPayload(node: node, session: session, settings: settings)
-        guard let payloadData = try? JSONEncoder().encode(payload) else {
-            recordLocalEvent(.critical, tag: "VPN", "编码隧道配置失败")
+        if vpnStatus == .connected {
+            let livePayload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: currentControlToken)
+            if let liveData = try? JSONEncoder().encode(livePayload) {
+                sendReloadPayload(liveData)
+                recordLocalEvent(.info, tag: "IDENTITY", "正在切换官方客户端身份 -> 「\(session.name)」")
+            }
             return
         }
 
-        if vpnStatus == .connected {
-            sendReloadPayload(payloadData)
-            recordLocalEvent(.info, tag: "IDENTITY", "正在切换官方客户端身份 -> 「\(session.name)」")
+        let freshToken = (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "")
+        currentControlToken = freshToken
+        let payload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: freshToken)
+        guard let payloadData = try? JSONEncoder().encode(payload) else {
+            recordLocalEvent(.critical, tag: "VPN", "编码隧道配置失败")
             return
         }
 
@@ -362,42 +367,51 @@ final class VpnManagerEngine: ObservableObject {
         guard vpnStatus == .connected,
               let sess = activeSession,
               let node = nodes.first(where: { $0.id == sess.boundNodeId }),
-              let data = try? JSONEncoder().encode(TunnelLaunchPayload(node: node, session: sess, settings: settings)) else {
+              let data = try? JSONEncoder().encode(TunnelLaunchPayload(node: node, session: sess, settings: settings, controlToken: currentControlToken)) else {
             return
         }
         sendReloadPayload(data)
     }
 
     private func sendTunnelCommand(_ cmd: String) {
-        guard vpnStatus == .connected,
-              let session = manager?.connection as? NETunnelProviderSession,
-              let data = cmd.data(using: .utf8) else { return }
-        do {
-            try session.sendProviderMessage(data) { [weak self] respData in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    guard let respData else {
-                        if !self.loggedIpcWarning {
-                            self.loggedIpcWarning = true
-                            self.recordLocalEvent(.warn, tag: "IPC", "XPC sendProviderMessage 返回空，已自动使用 127.0.0.1 状态镜像同步")
-                        }
-                        return
+        guard vpnStatus == .connected else { return }
+
+        // Primary: Authenticated loopback control channel (127.0.0.1:49271/cmd with per-session 256-bit X-CG-Token)
+        // Works 100% even when IPA re-signing makes Apple XPC sendProviderMessage return nil!
+        if !currentControlToken.isEmpty,
+           let url = URL(string: "http://127.0.0.1:\(SharedConstants.statusMirrorPort)/cmd"),
+           let body = cmd.data(using: .utf8) {
+            let token = currentControlToken
+            Task { [weak self] in
+                guard let self else { return }
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.httpBody = body
+                req.setValue(token, forHTTPHeaderField: "X-CG-Token")
+                req.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+                if let (data, resp) = try? await self.loopbackSession.data(for: req),
+                   let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                    if let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: data) {
+                        await MainActor.run { self.applyIncomingSnapshot(snap) }
                     }
-                    do {
-                        let snap = try JSONDecoder().decode(TunnelSnapshot.self, from: respData)
-                        self.applyIncomingSnapshot(snap)
-                    } catch {
-                        if !self.loggedIpcWarning {
-                            self.loggedIpcWarning = true
-                            self.recordLocalEvent(.warn, tag: "IPC", "解析扩展状态失败: \(error.localizedDescription)")
-                        }
-                    }
+                    return
                 }
+                // Silent fallback to Apple XPC if loopback control didn't respond
+                await MainActor.run { self.sendViaXpcFallback(cmd) }
             }
-        } catch {
-            if !loggedIpcWarning {
-                loggedIpcWarning = true
-                recordLocalEvent(.warn, tag: "IPC", "sendProviderMessage 报错: \(error.localizedDescription)（自动使用环回状态镜像）")
+            return
+        }
+
+        sendViaXpcFallback(cmd)
+    }
+
+    private func sendViaXpcFallback(_ cmd: String) {
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let data = cmd.data(using: .utf8) else { return }
+        try? session.sendProviderMessage(data) { [weak self] respData in
+            guard let respData, let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: respData) else { return }
+            Task { @MainActor [weak self] in
+                self?.applyIncomingSnapshot(snap)
             }
         }
     }

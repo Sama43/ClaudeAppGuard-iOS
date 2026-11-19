@@ -2,12 +2,10 @@ import Foundation
 
 /// Generates sing-box 1.14.4 TUN + FakeIP configs for iOS NEPacketTunnelProvider.
 ///
-/// Key Anti-Ban Invariants:
-/// - In Blackhole mode (starting / verifying / kill-switch tripped):
-///   Claude domains (or ALL traffic in global mode) hit action="reject" -> 0 direct packets EVER reach Anthropic!
-/// - In Protected mode:
-///   Claude domains route STRICTLY through "proxy" with FakeIP + remote DoH 1.1.1.1 (0 local DNS leak),
-///   and UDP 443 QUIC is rejected so official Claude iOS app uses rock-solid TCP TLS 1.3.
+/// Addressing (strictly disjoint so FakeIP NEVER collides with TUN or DNS!):
+/// - TUN IPv4: 172.19.0.1/30 (DNS: 172.19.0.2)
+/// - TUN IPv6: fdfe:dcba:9876::1/126
+/// - FakeIP pool: 198.18.0.0/15 & fc00::/18
 enum TunnelSingBoxConfigGenerator {
 
     static let claudeDomainSuffixes: [String] = [
@@ -16,12 +14,14 @@ enum TunnelSingBoxConfigGenerator {
         "claude.com",
         "claudeusercontent.com",
         "claudemcpclient.com",
+        "cloudflare.com",
         "challenges.cloudflare.com",
         "cloudflareinsights.com",
         "arkoselabs.com",
         "hcaptcha.com",
         "statsig.com",
         "statsigapi.net",
+        "featuregates.org",
         "intercom.io",
         "intercomcdn.com",
         "sentry.io",
@@ -30,13 +30,18 @@ enum TunnelSingBoxConfigGenerator {
         "segment.com",
         "launchdarkly.com",
         "stripe.com",
-        "stripe.network"
+        "stripe.network",
+        "revenuecat.com",
+        "stytch.com",
+        "auth0.com",
+        "workos.com"
     ]
 
     static let authHelperDomainSuffixes: [String] = [
         "accounts.google.com",
         "oauth2.googleapis.com",
         "apis.google.com",
+        "googleapis.com",
         "gstatic.com",
         "googleusercontent.com",
         "google.com",
@@ -52,7 +57,7 @@ enum TunnelSingBoxConfigGenerator {
         }
 
         let root: [String: Any] = [
-            "log": ["level": "warn", "timestamp": true],
+            "log": ["level": "warn", "timestamp": false],
             "dns": [
                 "servers": [
                     ["tag": "dns_remote", "type": "https", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query", "detour": "proxy"],
@@ -119,27 +124,32 @@ enum TunnelSingBoxConfigGenerator {
 
         var dnsRules: [[String: Any]] = []
         if settings.globalMode {
-            // In global mode, all non-bootstrap DNS goes to FakeIP / Remote DoH
+            // Global mode: A/AAAA -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy
             dnsRules.append(["query_type": ["A", "AAAA"], "server": "dns_fakeip"])
         } else {
-            // In Claude-only split mode, Claude/Anthropic domains use FakeIP; Chinese apps use fast local DNS
+            // Split mode: Claude/Anthropic A/AAAA -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy; Chinese apps -> fast local DNS
             dnsRules.append([
                 "domain_suffix": targetDomains,
-                "server": isBlackhole ? "dns_fakeip" : "dns_fakeip"
+                "query_type": ["A", "AAAA"],
+                "server": "dns_fakeip"
+            ])
+            dnsRules.append([
+                "domain_suffix": targetDomains,
+                "server": "dns_remote"
             ])
         }
 
         var routeRules: [[String: Any]] = [
             ["action": "sniff"],
             ["protocol": "dns", "action": "hijack-dns"],
-            // Reject QUIC (UDP 443) so Claude iOS app always falls back smoothly to reliable TCP TLS 1.3
-            ["network": "udp", "port": [443], "action": "reject"],
             // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog
             ["inbound": ["mixed-in"], "outbound": "proxy"]
         ]
 
         let routeFinal: String
         if settings.globalMode {
+            // Reject UDP 443 QUIC globally so TLS falls back cleanly to TCP
+            routeRules.append(["network": "udp", "port": [443], "action": "reject"])
             if isBlackhole {
                 routeRules.append(["inbound": ["tun-in"], "action": "reject"])
                 routeFinal = "proxy"
@@ -147,10 +157,21 @@ enum TunnelSingBoxConfigGenerator {
                 routeFinal = "proxy"
             }
         } else {
-            // Claude-Only Split Mode: non-Claude Chinese apps go direct; Claude goes strictly proxy or blackhole reject!
+            // Claude-Only Split Mode:
+            // Reject UDP 443 QUIC on Claude domains so official Claude iOS app uses reliable TCP TLS 1.3
+            routeRules.append([
+                "network": "udp",
+                "port": [443],
+                "domain_suffix": targetDomains,
+                "action": "reject"
+            ])
             if isBlackhole {
                 routeRules.append([
                     "domain_suffix": targetDomains,
+                    "action": "reject"
+                ])
+                routeRules.append([
+                    "ip_cidr": ["198.18.0.0/15", "fc00::/18"],
                     "action": "reject"
                 ])
             } else {
@@ -158,12 +179,16 @@ enum TunnelSingBoxConfigGenerator {
                     "domain_suffix": targetDomains,
                     "outbound": "proxy"
                 ])
+                routeRules.append([
+                    "ip_cidr": ["198.18.0.0/15", "fc00::/18"],
+                    "outbound": "proxy"
+                ])
             }
             routeFinal = "direct"
         }
 
         let root: [String: Any] = [
-            "log": ["level": "warn", "timestamp": true],
+            "log": ["level": "info", "timestamp": false],
             "dns": [
                 "servers": dnsServers,
                 "rules": dnsRules,
@@ -175,7 +200,7 @@ enum TunnelSingBoxConfigGenerator {
                     "type": "tun",
                     "tag": "tun-in",
                     "interface_name": "utun0",
-                    "address": ["198.18.0.1/32", "fc00::1/128"],
+                    "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
                     "mtu": 4064,
                     "auto_route": false,
                     "stack": "gvisor"

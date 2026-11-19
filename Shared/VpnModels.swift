@@ -29,6 +29,7 @@ struct TunnelLaunchPayload: Codable {
     var node: ProxyNode
     var session: AppIdentitySession?
     var settings: VpnGuardSettings
+    var controlToken: String = ""
 }
 
 enum ProxyProtocol: String, Codable, CaseIterable {

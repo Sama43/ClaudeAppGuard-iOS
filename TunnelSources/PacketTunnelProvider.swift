@@ -5,13 +5,24 @@ import NetworkExtension
 import UserNotifications
 import Corebridge
 
+private final class TunnelCmdBridge: NSObject, CorebridgeCommandHandlerProtocol {
+    weak var owner: PacketTunnelProvider?
+    init(owner: PacketTunnelProvider) {
+        self.owner = owner
+    }
+    func onControlCommand(_ cmd: String?) {
+        guard let cmd, !cmd.isEmpty else { return }
+        owner?.processControlCommand(cmd)
+    }
+}
+
 /// iOS NEPacketTunnelProvider for Official Claude iOS App Isolation with Fail-Closed Blackhole Kill-Switch.
 ///
 /// Lifecycle:
-/// 1. Starts read-only loopback status mirror (127.0.0.1:49271) + configures utun (MTU 4064, DNS 198.18.0.2).
+/// 1. Starts loopback status+control mirror (127.0.0.1:49271) + configures utun (172.19.0.1/30, DNS 172.19.0.2, MTU 4064).
 /// 2. Immediately starts sing-box in BLACKHOLE MODE FIRST (all Claude domains -> action="reject") -> 0 startup leak!
 /// 3. Verifies Exit IP & Country strictly via local mixed-in (127.0.0.1:<probePort>).
-/// 4. ONLY on passing all region & IP-pin rules -> hot-swaps sing-box into PROTECTED MODE.
+/// 4. ONLY on passing all region & IP-pin rules -> hot-swaps sing-box into PROTECTED MODE (FakeIP 198.18.0.0/15, 0 overlap!).
 /// 5. Runs a 5-second Watchdog (configurable 3s/5s/10s/20s, 4s timeout) + NWPathMonitor in background;
 ///    on ANY anomaly, immediately hot-swaps back to BLACKHOLE MODE & posts a local notification!
 final class PacketTunnelProvider: NEPacketTunnelProvider {
@@ -20,6 +31,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let pathMonitor = NWPathMonitor()
     private let pathQueue = DispatchQueue(label: "com.claudeguard.iosvpn.tunnel.path")
     private let stateLock = NSLock()
+    private var cmdBridge: TunnelCmdBridge?
 
     private var utunFd: Int32 = -1
     private var probePort: Int = 18088
@@ -30,13 +42,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var watchdogTask: Task<Void, Never>?
     private var verifyTask: Task<Void, Never>?
+    private var logPumpTask: Task<Void, Never>?
     private var lastInterface: NWInterface.InterfaceType?
     private var isBlackholeActive = true
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        _ = CorebridgeStartStatusServer(SharedConstants.statusMirrorPort)
-
         let payload = resolveLaunchPayload(options: options)
+
+        let bridge = TunnelCmdBridge(owner: self)
+        self.cmdBridge = bridge
+        _ = CorebridgeStartStatusServer(
+            SharedConstants.statusMirrorPort,
+            payload?.controlToken ?? "",
+            bridge
+        )
 
         let targetNode: ProxyNode
         let session: AppIdentitySession?
@@ -100,7 +119,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.utunFd = fd
-            self.recordEvent(.info, tag: "TUN", "已接管系统 utun (fd=\(fd), probePort=\(self.probePort))")
+            self.recordEvent(.info, tag: "TUN", "已接管系统 utun (fd=\(fd), TUN=172.19.0.1/30, DNS=172.19.0.2)")
 
             // Step 1: IMMEDIATELY start sing-box in BLACKHOLE MODE FIRST (zero startup leak!)
             let blackholeErr = self.applySingBoxMode(isBlackhole: true)
@@ -112,8 +131,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // Signal iOS that VPN tunnel is UP (currently sealed in Blackhole mode!)
             completionHandler(nil)
 
-            // Start network switch / drop monitor
+            // Start network switch / drop monitor + live log mirror pump
             self.startPathMonitor()
+            self.startLogPump()
 
             // Step 2: Verify Exit IP & Country strictly via probePort BEFORE opening Claude access!
             self.triggerVerification(enrichGeo: true)
@@ -137,6 +157,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         watchdogTask?.cancel()
         verifyTask?.cancel()
+        logPumpTask?.cancel()
         pathMonitor.cancel()
         CorebridgeStopTunnelCore()
         withState {
@@ -145,12 +166,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         recordEvent(.info, tag: "TUN", "隔离 VPN 已停止")
         CorebridgeStopStatusServer()
+        cmdBridge = nil
         completionHandler()
     }
 
-    /// Always replies IMMEDIATELY (< 1ms) so XPC sendProviderMessage NEVER blocks or times out.
-    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        let cmd = String(data: messageData, encoding: .utf8) ?? ""
+    /// Handles control commands arriving from EITHER Apple XPC (handleAppMessage) OR authenticated loopback POST /cmd.
+    func processControlCommand(_ cmd: String) {
         if cmd.hasPrefix("reload_payload:") {
             let b64 = String(cmd.dropFirst("reload_payload:".count))
             if let raw = Data(base64Encoded: b64),
@@ -165,8 +186,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.snapshot.activeNodeName = payload.node.name
                     self.snapshot.killSwitchReason = nil
                 }
-                recordEvent(.info, tag: "IDENTITY", "正在切换隔离身份 -> \(payload.session?.name ?? payload.node.name)")
-                completionHandler?(encodeSnapshot())
+                recordEvent(.info, tag: "IDENTITY", "正在切换隔离身份/策略 -> \(payload.session?.name ?? payload.node.name)")
                 Task.detached(priority: .userInitiated) { [weak self] in
                     guard let self else { return }
                     _ = self.applySingBoxMode(isBlackhole: true)
@@ -179,7 +199,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         switch cmd {
         case "kill_switch":
             engageBlackholeKillSwitch(reason: "已手动触发黑洞熔断（官方 Claude 流量已彻底封锁）", sendPush: false)
-            completionHandler?(encodeSnapshot())
 
         case "reverify":
             withState {
@@ -187,7 +206,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.snapshot.killSwitchReason = nil
             }
             persistSnapshot()
-            completionHandler?(encodeSnapshot())
             triggerVerification(enrichGeo: true)
 
         case "reload":
@@ -195,7 +213,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.snapshot.status = .verifyingExit
             }
             persistSnapshot()
-            completionHandler?(encodeSnapshot())
             Task.detached(priority: .userInitiated) { [weak self] in
                 guard let self else { return }
                 self.reloadConfigFromStorage()
@@ -203,11 +220,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
         default:
-            withState {
-                snapshot.coreLogs = currentCoreLogs()
-            }
-            completionHandler?(encodeSnapshot())
+            persistSnapshot()
         }
+    }
+
+    /// Always replies IMMEDIATELY (< 1ms) so XPC sendProviderMessage NEVER blocks or times out.
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        let cmd = String(data: messageData, encoding: .utf8) ?? ""
+        if cmd != "status" && !cmd.isEmpty {
+            processControlCommand(cmd)
+        } else {
+            persistSnapshot()
+        }
+        completionHandler?(encodeSnapshot())
     }
 
     private func triggerVerification(enrichGeo: Bool) {
@@ -215,6 +240,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         verifyTask = Task { [weak self] in
             guard let self else { return }
             await self.verifyAndActivateIfSafe(enrichGeo: enrichGeo)
+        }
+    }
+
+    private func startLogPump() {
+        logPumpTask?.cancel()
+        logPumpTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self else { break }
+                self.persistSnapshot()
+            }
         }
     }
 
@@ -253,9 +289,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return err
             }
             self.isBlackholeActive = isBlackhole
-            withState {
-                snapshot.coreLogs = currentCoreLogs()
-            }
             persistSnapshot()
             return nil
         } catch {
@@ -270,7 +303,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         recordEvent(.info, tag: "VERIFY", "黑洞锁定下正在通过节点校验海外出口 IP...")
 
-        // Ensure core is running (if currently stopped, start in Blackhole mode to probe)
         if !CorebridgeIsRunning() {
             if let err = applySingBoxMode(isBlackhole: true) {
                 engageBlackholeKillSwitch(reason: "代理内核启动失败: \(err)", sendPush: true)
@@ -411,26 +443,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let net = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         net.mtu = 4064
 
-        let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.255"])
+        // Official sing-box iOS TUN addressing (172.19.0.1/30, DNS 172.19.0.2) — 100% disjoint from FakeIP 198.18.0.0/15!
+        let ipv4 = NEIPv4Settings(addresses: ["172.19.0.1"], subnetMasks: ["255.255.255.252"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
         var excludedV4 = [
             NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0")
         ]
         if !settings.globalMode {
+            // Note: Do NOT exclude 172.16.0.0/12 so 172.19.0.2 DNS always enters utun!
             excludedV4.append(contentsOf: [
                 NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"),
-                NEIPv4Route(destinationAddress: "172.16.0.0", subnetMask: "255.240.0.0"),
                 NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0")
             ])
         }
         ipv4.excludedRoutes = excludedV4
         net.ipv4Settings = ipv4
 
-        let ipv6 = NEIPv6Settings(addresses: ["fc00::1"], networkPrefixLengths: [128])
+        let ipv6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::1"], networkPrefixLengths: [126])
         ipv6.includedRoutes = [NEIPv6Route.default()]
         net.ipv6Settings = ipv6
 
-        let dns = NEDNSSettings(servers: ["198.18.0.2"])
+        let dns = NEDNSSettings(servers: ["172.19.0.2"])
         dns.matchDomains = [""]
         net.dnsSettings = dns
         return net
@@ -458,13 +491,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if snapshot.recentEvents.count > 100 {
                 snapshot.recentEvents = Array(snapshot.recentEvents.prefix(100))
             }
-            snapshot.coreLogs = currentCoreLogs()
         }
         persistSnapshot()
     }
 
     private func persistSnapshot() {
+        let logs = currentCoreLogs()
         let snapCopy: TunnelSnapshot = withState {
+            snapshot.coreLogs = logs
             snapshot.updatedAt = Date()
             return snapshot
         }
@@ -476,7 +510,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func encodeSnapshot() -> Data? {
-        let snapCopy: TunnelSnapshot = withState { snapshot }
+        let logs = currentCoreLogs()
+        let snapCopy: TunnelSnapshot = withState {
+            snapshot.coreLogs = logs
+            return snapshot
+        }
         return try? JSONEncoder().encode(snapCopy)
     }
 
