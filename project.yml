@@ -84,7 +84,7 @@ targets:
         CODE_SIGN_ENTITLEMENTS: TunnelResources/PacketTunnel.entitlements
         ENABLE_BITCODE: NO
         SKIP_INSTALL: YES
-        APPLICATION_EXTENSION_API_ONLY: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
         FRAMEWORK_SEARCH_PATHS:
           - "$(inherited)"
           - "$(PROJECT_DIR)/Frameworks"
