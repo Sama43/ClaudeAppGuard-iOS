@@ -1,0 +1,216 @@
+import Foundation
+
+/// Generates sing-box 1.14.4 TUN + FakeIP configs for iOS NEPacketTunnelProvider.
+///
+/// Key Anti-Ban Invariants:
+/// - In Blackhole mode (starting / verifying / kill-switch tripped):
+///   Claude domains (or ALL traffic in global mode) hit action="reject" -> 0 direct packets EVER reach Anthropic!
+/// - In Protected mode:
+///   Claude domains route STRICTLY through "proxy" with FakeIP + remote DoH 1.1.1.1 (0 local DNS leak),
+///   and UDP 443 QUIC is rejected so official Claude iOS app uses rock-solid TCP TLS 1.3.
+enum TunnelSingBoxConfigGenerator {
+
+    static let claudeDomainSuffixes: [String] = [
+        "claude.ai",
+        "anthropic.com",
+        "claude.com",
+        "claudeusercontent.com",
+        "claudemcpclient.com",
+        "challenges.cloudflare.com",
+        "cloudflareinsights.com",
+        "arkoselabs.com",
+        "hcaptcha.com",
+        "statsig.com",
+        "statsigapi.net",
+        "intercom.io",
+        "intercomcdn.com",
+        "sentry.io",
+        "datadoghq.com",
+        "segment.io",
+        "segment.com",
+        "launchdarkly.com",
+        "stripe.com",
+        "stripe.network"
+    ]
+
+    static let authHelperDomainSuffixes: [String] = [
+        "accounts.google.com",
+        "oauth2.googleapis.com",
+        "apis.google.com",
+        "gstatic.com",
+        "googleusercontent.com",
+        "google.com",
+        "appleid.apple.com"
+    ]
+
+    /// Generates a non-TUN probe-only config for isolated single-node speed testing in main app.
+    static func generateStandaloneProbe(node: ProxyNode, corePort: Int) throws -> String {
+        var proxyOutbound = try decodeOutbound(node)
+        proxyOutbound["tag"] = "proxy"
+        if proxyOutbound["domain_resolver"] == nil {
+            proxyOutbound["domain_resolver"] = "dns_bootstrap"
+        }
+
+        let root: [String: Any] = [
+            "log": ["level": "warn", "timestamp": true],
+            "dns": [
+                "servers": [
+                    ["tag": "dns_remote", "type": "https", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query", "detour": "proxy"],
+                    ["tag": "dns_bootstrap", "type": "udp", "server": "223.5.5.5", "server_port": 53]
+                ],
+                "final": "dns_remote",
+                "strategy": "ipv4_only"
+            ],
+            "inbounds": [
+                ["type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": corePort]
+            ],
+            "outbounds": [proxyOutbound],
+            "route": [
+                "rules": [
+                    ["inbound": ["mixed-in"], "outbound": "proxy"]
+                ],
+                "final": "proxy",
+                "default_domain_resolver": "dns_bootstrap"
+            ]
+        ]
+        return try encodeJson(root)
+    }
+
+    /// Generates the iOS PacketTunnel sing-box 1.14.4 config (either Blackhole Kill-Switch or Protected mode).
+    static func generateTunnelConfig(
+        node: ProxyNode,
+        probePort: Int,
+        settings: VpnGuardSettings,
+        isBlackhole: Bool
+    ) throws -> String {
+        var proxyOutbound = try decodeOutbound(node)
+        proxyOutbound["tag"] = "proxy"
+        if proxyOutbound["domain_resolver"] == nil {
+            proxyOutbound["domain_resolver"] = "dns_local"
+        }
+
+        let targetDomains = settings.includeAuthHelperDomains
+            ? (claudeDomainSuffixes + authHelperDomainSuffixes)
+            : claudeDomainSuffixes
+
+        // DNS servers: FakeIP for protected domains so zero local ISP DNS queries leak!
+        let dnsServers: [[String: Any]] = [
+            [
+                "tag": "dns_remote",
+                "type": "https",
+                "server": "1.1.1.1",
+                "server_port": 443,
+                "path": "/dns-query",
+                "detour": "proxy"
+            ],
+            [
+                "tag": "dns_local",
+                "type": "udp",
+                "server": "223.5.5.5",
+                "server_port": 53
+            ],
+            [
+                "tag": "dns_fakeip",
+                "type": "fakeip",
+                "inet4_range": "198.18.0.0/15",
+                "inet6_range": "fc00::/18"
+            ]
+        ]
+
+        var dnsRules: [[String: Any]] = []
+        if settings.globalMode {
+            // In global mode, all non-bootstrap DNS goes to FakeIP / Remote DoH
+            dnsRules.append(["query_type": ["A", "AAAA"], "server": "dns_fakeip"])
+        } else {
+            // In Claude-only split mode, Claude/Anthropic domains use FakeIP; Chinese apps use fast local DNS
+            dnsRules.append([
+                "domain_suffix": targetDomains,
+                "server": isBlackhole ? "dns_fakeip" : "dns_fakeip"
+            ])
+        }
+
+        var routeRules: [[String: Any]] = [
+            ["action": "sniff"],
+            ["protocol": "dns", "action": "hijack-dns"],
+            // Reject QUIC (UDP 443) so Claude iOS app always falls back smoothly to reliable TCP TLS 1.3
+            ["network": "udp", "port": [443], "action": "reject"],
+            // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog
+            ["inbound": ["mixed-in"], "outbound": "proxy"]
+        ]
+
+        let routeFinal: String
+        if settings.globalMode {
+            if isBlackhole {
+                routeRules.append(["inbound": ["tun-in"], "action": "reject"])
+                routeFinal = "proxy"
+            } else {
+                routeFinal = "proxy"
+            }
+        } else {
+            // Claude-Only Split Mode: non-Claude Chinese apps go direct; Claude goes strictly proxy or blackhole reject!
+            if isBlackhole {
+                routeRules.append([
+                    "domain_suffix": targetDomains,
+                    "action": "reject"
+                ])
+            } else {
+                routeRules.append([
+                    "domain_suffix": targetDomains,
+                    "outbound": "proxy"
+                ])
+            }
+            routeFinal = "direct"
+        }
+
+        let root: [String: Any] = [
+            "log": ["level": "warn", "timestamp": true],
+            "dns": [
+                "servers": dnsServers,
+                "rules": dnsRules,
+                "final": settings.globalMode ? "dns_remote" : "dns_local",
+                "strategy": "ipv4_only"
+            ],
+            "inbounds": [
+                [
+                    "type": "tun",
+                    "tag": "tun-in",
+                    "interface_name": "utun0",
+                    "address": ["198.18.0.1/32", "fc00::1/128"],
+                    "mtu": 8500,
+                    "auto_route": false,
+                    "stack": "gvisor"
+                ],
+                [
+                    "type": "mixed",
+                    "tag": "mixed-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": probePort
+                ]
+            ],
+            "outbounds": [
+                proxyOutbound,
+                ["type": "direct", "tag": "direct"]
+            ],
+            "route": [
+                "rules": routeRules,
+                "final": routeFinal,
+                "default_domain_resolver": "dns_local"
+            ]
+        ]
+
+        return try encodeJson(root)
+    }
+
+    private static func decodeOutbound(_ node: ProxyNode) throws -> [String: Any] {
+        guard let data = node.singBoxOutboundJson.data(using: .utf8),
+              let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "TunnelConfig", code: 1, userInfo: [NSLocalizedDescriptionKey: "节点 outbound JSON 无效"])
+        }
+        return obj
+    }
+
+    private static func encodeJson(_ root: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: root)
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+}

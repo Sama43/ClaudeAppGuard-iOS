@@ -1,0 +1,386 @@
+import Foundation
+import Darwin
+import Network
+import NetworkExtension
+import UserNotifications
+import Corebridge
+
+/// iOS NEPacketTunnelProvider for Official Claude iOS App Isolation with Fail-Closed Blackhole Kill-Switch.
+///
+/// Lifecycle:
+/// 1. Configures utun (IPv4 198.18.0.1/32 + 0.0.0.0/0, IPv6 fc00::1/128 + ::/0, DNS 198.18.0.2, MTU 8500).
+/// 2. Immediately starts sing-box in BLACKHOLE MODE FIRST (all Claude domains -> action="reject") -> 0 startup leak!
+/// 3. Verifies Exit IP & Country strictly via local mixed-in (127.0.0.1:<probePort>).
+/// 4. ONLY on passing all region & IP-pin rules -> hot-swaps sing-box into PROTECTED MODE.
+/// 5. Runs a 5-second Watchdog (configurable 3s/5s/10s/20s, 4s timeout) + NWPathMonitor in background;
+///    on ANY anomaly, immediately hot-swaps back to BLACKHOLE MODE & posts a local notification!
+final class PacketTunnelProvider: NEPacketTunnelProvider {
+
+    private let storage = SharedStorage()
+    private let pathMonitor = NWPathMonitor()
+    private let pathQueue = DispatchQueue(label: "com.claudeguard.iosvpn.tunnel.path")
+
+    private var utunFd: Int32 = -1
+    private var probePort: Int = 18088
+    private var currentNode: ProxyNode?
+    private var currentSession: AppIdentitySession?
+    private var settings: VpnGuardSettings = VpnGuardSettings()
+    private var snapshot: TunnelSnapshot = TunnelSnapshot()
+
+    private var watchdogTask: Task<Void, Never>?
+    private var lastInterface: NWInterface.InterfaceType?
+    private var isBlackholeActive = true
+
+    override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        self.settings = storage.loadSettings()
+        let nodes = storage.loadNodes()
+        let sessions = storage.loadSessions()
+        let activeSessionId = storage.loadActiveSessionId()
+
+        let session = activeSessionId.flatMap { id in sessions.first { $0.id == id } } ?? sessions.first
+        let node: ProxyNode?
+        if let s = session {
+            node = nodes.first { $0.id == s.boundNodeId }
+        } else {
+            node = nodes.first
+        }
+
+        guard let targetNode = node else {
+            let err = NSError(domain: "ClaudeAppGuard", code: 1, userInfo: [NSLocalizedDescriptionKey: "未找到可用代理节点，请先在主 App 中导入节点"])
+            completionHandler(err)
+            return
+        }
+
+        self.currentSession = session
+        self.currentNode = targetNode
+        self.probePort = allocateLoopbackPort()
+        self.snapshot = TunnelSnapshot(
+            status: .startingCore,
+            activeSessionId: session?.id,
+            activeSessionName: session?.name,
+            activeNodeName: targetNode.name
+        )
+        recordEvent(.info, tag: "TUN", "正在建立 iOS 隔离隧道 -> \(targetNode.name)")
+
+        let netSettings = buildTunnelNetworkSettings()
+        setTunnelNetworkSettings(netSettings) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.recordEvent(.critical, tag: "TUN", "配置 TUN 网络失败: \(error.localizedDescription)")
+                completionHandler(error)
+                return
+            }
+
+            // Acquire iOS utun file descriptor
+            var fd = CorebridgeFindUtunFileDescriptor()
+            if fd < 0 {
+                fd = (self.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32) ?? -1
+            }
+            guard fd >= 0 else {
+                let err = NSError(domain: "ClaudeAppGuard", code: 2, userInfo: [NSLocalizedDescriptionKey: "无法获取系统 utun 文件描述符"])
+                self.recordEvent(.critical, tag: "TUN", err.localizedDescription)
+                completionHandler(err)
+                return
+            }
+            self.utunFd = fd
+
+            // Step 1: IMMEDIATELY start sing-box in BLACKHOLE MODE FIRST (zero startup leak!)
+            let blackholeErr = self.applySingBoxMode(isBlackhole: true)
+            if let blackholeErr {
+                completionHandler(NSError(domain: "ClaudeAppGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: blackholeErr]))
+                return
+            }
+
+            // Signal iOS that VPN tunnel is UP (currently sealed in Blackhole mode!)
+            completionHandler(nil)
+
+            // Start network switch / drop monitor
+            self.startPathMonitor()
+
+            // Step 2: Verify Exit IP & Country strictly via probePort BEFORE opening Claude access!
+            Task {
+                await self.verifyAndActivateIfSafe(enrichGeo: true)
+            }
+        }
+    }
+
+    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        watchdogTask?.cancel()
+        pathMonitor.cancel()
+        CorebridgeStopTunnelCore()
+        snapshot.status = .stopped
+        snapshot.killSwitchReason = nil
+        recordEvent(.info, tag: "TUN", "隔离 VPN 已停止")
+        completionHandler()
+    }
+
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        let cmd = String(data: messageData, encoding: .utf8) ?? ""
+        switch cmd {
+        case "kill_switch":
+            engageBlackholeKillSwitch(reason: "已手动触发黑洞熔断（官方 Claude 流量已彻底封锁）", sendPush: false)
+            completionHandler?(encodeSnapshot())
+
+        case "reverify":
+            Task {
+                self.settings = self.storage.loadSettings()
+                await self.verifyAndActivateIfSafe(enrichGeo: true)
+                completionHandler?(self.encodeSnapshot())
+            }
+
+        case "reload":
+            Task {
+                self.reloadConfigFromStorage()
+                await self.verifyAndActivateIfSafe(enrichGeo: true)
+                completionHandler?(self.encodeSnapshot())
+            }
+
+        default:
+            snapshot.coreLogs = currentCoreLogs()
+            completionHandler?(encodeSnapshot())
+        }
+    }
+
+    // MARK: - Fail-Closed Blackhole & Verification Logic
+
+    private func reloadConfigFromStorage() {
+        self.settings = storage.loadSettings()
+        let nodes = storage.loadNodes()
+        let sessions = storage.loadSessions()
+        let sid = storage.loadActiveSessionId()
+        let sess = sid.flatMap { id in sessions.first { $0.id == id } }
+        self.currentSession = sess
+        if let s = sess, let n = nodes.first(where: { $0.id == s.boundNodeId }) {
+            self.currentNode = n
+            snapshot.activeSessionId = s.id
+            snapshot.activeSessionName = s.name
+            snapshot.activeNodeName = n.name
+        }
+        _ = applySingBoxMode(isBlackhole: true)
+    }
+
+    private func applySingBoxMode(isBlackhole: Bool) -> String? {
+        guard let node = currentNode, utunFd >= 0 else { return "缺少节点或 utun fd" }
+        do {
+            let cfg = try TunnelSingBoxConfigGenerator.generateTunnelConfig(
+                node: node,
+                probePort: probePort,
+                settings: settings,
+                isBlackhole: isBlackhole
+            )
+            let err = CorebridgeStartTunnelCore(cfg, utunFd)
+            if !err.isEmpty {
+                recordEvent(.critical, tag: "CORE", "sing-box 启动失败: \(err)")
+                return err
+            }
+            self.isBlackholeActive = isBlackhole
+            snapshot.coreLogs = currentCoreLogs()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private func verifyAndActivateIfSafe(enrichGeo: Bool) async {
+        snapshot.status = .verifyingExit
+        snapshot.killSwitchReason = nil
+        persistSnapshot()
+
+        // Ensure core is running (if currently stopped, start in Blackhole mode to probe)
+        if !CorebridgeIsRunning() {
+            if let err = applySingBoxMode(isBlackhole: true) {
+                engageBlackholeKillSwitch(reason: "代理内核启动失败: \(err)", sendPush: true)
+                return
+            }
+        }
+
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let check = await ExitIpVerifier.verify(corePort: probePort, enrichGeo: enrichGeo, timeoutSec: enrichGeo ? 8 : 4)
+        guard check.success, let ip = check.exitIp, let cc = check.countryCode else {
+            engageBlackholeKillSwitch(reason: "代理链路中断或超时：\(check.error ?? "无响应")（已切入黑洞封锁官方 Claude，零直连）", sendPush: true)
+            return
+        }
+
+        if let violation = evaluatePolicyViolation(exitIp: ip, countryCode: cc) {
+            snapshot.exitIp = ip
+            snapshot.exitCountry = cc
+            snapshot.latencyMs = check.latencyMs
+            engageBlackholeKillSwitch(reason: violation, sendPush: true)
+            return
+        }
+
+        // All checks PASSED -> switch sing-box from Blackhole to Protected Mode if needed
+        if isBlackholeActive {
+            if let err = applySingBoxMode(isBlackhole: false) {
+                engageBlackholeKillSwitch(reason: "切换放行模式失败: \(err)", sendPush: true)
+                return
+            }
+        }
+
+        snapshot.status = .protected
+        snapshot.exitIp = ip
+        snapshot.exitCountry = cc
+        snapshot.exitCity = check.city ?? snapshot.exitCity
+        snapshot.exitOrg = check.org ?? snapshot.exitOrg
+        snapshot.latencyMs = check.latencyMs
+        snapshot.killSwitchReason = nil
+        recordEvent(.success, tag: "PROTECTED", "出口校验通过 -> \(cc) · \(ip) (\(check.latencyMs ?? 0)ms)")
+
+        startWatchdogLoop()
+    }
+
+    private func engageBlackholeKillSwitch(reason: String, sendPush: Bool) {
+        watchdogTask?.cancel()
+        _ = applySingBoxMode(isBlackhole: true)
+        snapshot.status = .blackholeKillSwitch
+        snapshot.killSwitchReason = reason
+        recordEvent(.critical, tag: "KILL_SWITCH", reason)
+        if sendPush {
+            postKillSwitchNotification(reason: reason)
+        }
+    }
+
+    private func evaluatePolicyViolation(exitIp: String, countryCode: String) -> String? {
+        let cc = countryCode.uppercased()
+        if settings.blockedCountries.contains(cc) {
+            return "高危地区黑洞熔断！出口位于禁止地区 [\(cc)] (\(exitIp))，已封锁官方 Claude"
+        }
+        if !settings.allowedCountries.isEmpty && !settings.allowedCountries.contains(cc) {
+            return "地区白名单黑洞熔断！出口 [\(cc)] 不在允许列表内"
+        }
+        if settings.lockExitIp, let pinned = settings.pinnedExitIp, !pinned.isEmpty, exitIp != pinned {
+            return "全局锁 IP 漂移熔断！锁定 \(pinned) 已变为 \(exitIp) (\(cc))"
+        }
+        if let sess = currentSession, sess.lockExitIp, let pinned = sess.pinnedExitIp, !pinned.isEmpty, exitIp != pinned {
+            return "身份「\(sess.name)」IP 漂移熔断！锁定 \(pinned) 已变为 \(exitIp) (\(cc))"
+        }
+        return nil
+    }
+
+    private func startWatchdogLoop() {
+        watchdogTask?.cancel()
+        watchdogTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { break }
+                self.settings = self.storage.loadSettings()
+                let sec = max(3, min(120, self.settings.watchdogIntervalSec))
+                try? await Task.sleep(nanoseconds: UInt64(sec) * 1_000_000_000)
+                if Task.isCancelled || self.snapshot.status != .protected { break }
+                if !CorebridgeIsRunning() {
+                    self.engageBlackholeKillSwitch(reason: "后台巡检发现代理内核停止，已切入黑洞熔断", sendPush: true)
+                    break
+                }
+                let check = await ExitIpVerifier.verify(corePort: self.probePort, enrichGeo: false, timeoutSec: 4)
+                guard check.success, let ip = check.exitIp, let cc = check.countryCode else {
+                    self.engageBlackholeKillSwitch(reason: "5秒巡检超时/断线（\(check.error ?? "无响应")），已瞬时黑洞封锁官方 Claude", sendPush: true)
+                    break
+                }
+                if let violation = self.evaluatePolicyViolation(exitIp: ip, countryCode: cc) {
+                    self.engageBlackholeKillSwitch(reason: violation, sendPush: true)
+                    break
+                }
+                self.snapshot.exitIp = ip
+                self.snapshot.exitCountry = cc
+                self.snapshot.latencyMs = check.latencyMs
+                self.persistSnapshot()
+            }
+        }
+    }
+
+    private func startPathMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let cur = path.availableInterfaces.first { $0.type != .other }?.type
+            let prev = self.lastInterface
+            self.lastInterface = cur
+
+            if path.status != .satisfied {
+                if self.snapshot.status == .protected {
+                    self.engageBlackholeKillSwitch(reason: "检测到物理网络断开！已瞬时黑洞封锁官方 Claude，零直连", sendPush: true)
+                }
+                return
+            }
+
+            if let prev, let cur, prev != cur, self.settings.killOnNetworkChange, self.snapshot.status == .protected {
+                self.engageBlackholeKillSwitch(reason: "检测到 Wi-Fi/蜂窝切换，正在黑洞保护下重新校验出口...", sendPush: false)
+                Task { await self.verifyAndActivateIfSafe(enrichGeo: true) }
+            }
+        }
+        pathMonitor.start(queue: pathQueue)
+    }
+
+    private func buildTunnelNetworkSettings() -> NEPacketTunnelNetworkSettings {
+        let net = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+        net.mtu = 8500
+
+        let ipv4 = NEIPv4Settings(addresses: ["198.18.0.1"], subnetMasks: ["255.255.255.255"])
+        ipv4.includedRoutes = [NEIPv4Route.default()]
+        net.ipv4Settings = ipv4
+
+        let ipv6 = NEIPv6Settings(addresses: ["fc00::1"], networkPrefixLengths: [128])
+        ipv6.includedRoutes = [NEIPv6Route.default()]
+        net.ipv6Settings = ipv6
+
+        let dns = NEDNSSettings(servers: ["198.18.0.2"])
+        dns.matchDomains = [""]
+        net.dnsSettings = dns
+        return net
+    }
+
+    private func postKillSwitchNotification(reason: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "ClaudeAppGuard 黑洞熔断已生效"
+        content.body = reason
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: "cg_kill_switch", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    private func recordEvent(_ level: EventLevel, tag: String, _ message: String) {
+        snapshot.recentEvents.insert(SecurityEvent(level: level, tag: tag, message: message), at: 0)
+        if snapshot.recentEvents.count > 100 {
+            snapshot.recentEvents = Array(snapshot.recentEvents.prefix(100))
+        }
+        snapshot.coreLogs = currentCoreLogs()
+        persistSnapshot()
+    }
+
+    private func persistSnapshot() {
+        snapshot.updatedAt = Date()
+        storage.saveSnapshot(snapshot)
+    }
+
+    private func encodeSnapshot() -> Data? {
+        try? JSONEncoder().encode(snapshot)
+    }
+
+    private func currentCoreLogs() -> [String] {
+        let raw = CorebridgeGetLogs()
+        return raw.isEmpty ? [] : raw.components(separatedBy: .newlines)
+    }
+
+    private func allocateLoopbackPort() -> Int {
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return 18088 }
+        defer { Darwin.close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let ok = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if ok != 0 { return 18088 }
+        var out = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &out) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(fd, $0, &len)
+            }
+        }
+        return Int(UInt16(bigEndian: out.sin_port))
+    }
+}
