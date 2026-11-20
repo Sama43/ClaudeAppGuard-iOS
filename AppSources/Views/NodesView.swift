@@ -130,6 +130,7 @@ struct NodesView: View {
                                     Spacer()
                                 }
                                 Text("\(node.server):\(node.port)").font(.caption2).foregroundStyle(VpnTheme.textSecondary).lineLimit(1)
+                                if node.skipsTLSVerification { Text("此节点已关闭 TLS 证书验证").font(.caption2).foregroundStyle(VpnTheme.killRed) }
                                 if let cc = node.lastExitCountry {
                                     Text("出口: \(cc) · \(node.lastExitIp ?? "") · \(node.lastLatencyMs ?? 0)ms").font(.caption2).foregroundStyle(VpnTheme.shieldGreen)
                                 }
@@ -206,6 +207,7 @@ private struct VpnImportSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var tab = 0
+    @State private var allowDirect = true
     @State private var subName = ""
     @State private var subUrl = ""
     @State private var rawText = ""
@@ -221,6 +223,7 @@ private struct VpnImportSheet: View {
                 }.pickerStyle(.segmented)
                 if tab == 0 {
                     Section("机场订阅 URL (Clash YAML / V2Ray Base64)") {
+                        Toggle("未连接时允许直接下载订阅", isOn: $allowDirect)
                         TextField("订阅名称 (可选)", text: $subName)
                         TextField("https://...", text: $subUrl).textInputAutocapitalization(.never).autocorrectionDisabled()
                     }
@@ -246,7 +249,7 @@ private struct VpnImportSheet: View {
                             Task {
                                 defer { loading = false }
                                 do {
-                                    let (s, c) = try await engine.addAndSyncSubscription(name: subName, url: subUrl, allowDirectBootstrap: true)
+                                    let (s, c) = try await engine.addAndSyncSubscription(name: subName, url: subUrl, allowDirectBootstrap: allowDirect)
                                     onFinish("已导入订阅「\(s.name)」共 \(c) 个节点")
                                 } catch {
                                     importError = error.localizedDescription

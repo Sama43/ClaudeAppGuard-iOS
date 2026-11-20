@@ -7,7 +7,7 @@ enum ExitIpVerifier {
     static func makeStrictlyProxiedSession(corePort: Int, timeoutSec: TimeInterval) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = timeoutSec
-        config.timeoutIntervalForResource = timeoutSec + 2
+        config.timeoutIntervalForResource = timeoutSec
         config.waitsForConnectivity = false
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
 
@@ -20,14 +20,15 @@ enum ExitIpVerifier {
     }
 
     static func verify(corePort: Int, enrichGeo: Bool = true, timeoutSec: TimeInterval = 8) async -> ExitCheckResult {
-        guard corePort > 0 else {
+        guard (1...65535).contains(corePort) else {
             return ExitCheckResult(success: false, error: "代理内核端口无效")
         }
 
         let session = makeStrictlyProxiedSession(corePort: corePort, timeoutSec: timeoutSec)
         defer { session.invalidateAndCancel() }
 
-        let start = Date()
+        let start = ProcessInfo.processInfo.systemUptime
+        let deadline = start + timeoutSec
 
         // Primary fast check: Cloudflare trace (returns ip= and loc=)
         var exitIp: String?
@@ -37,6 +38,7 @@ enum ExitIpVerifier {
         if let url = URL(string: "https://www.cloudflare.com/cdn-cgi/trace") {
             do {
                 var req = URLRequest(url: url)
+                req.timeoutInterval = timeoutSec / 2
                 req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
                 let (data, resp) = try await session.data(for: req)
                 if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
@@ -61,7 +63,9 @@ enum ExitIpVerifier {
         // Fallback: api.country.is
         if exitIp == nil || country == nil, let url = URL(string: "https://api.country.is/") {
             do {
-                let (data, resp) = try await session.data(from: url)
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0, !Task.isCancelled else { throw URLError(.timedOut) }
+                let (data, resp) = try await session.data(for: URLRequest(url: url, timeoutInterval: remaining))
                 if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
                    let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     exitIp = obj["ip"] as? String
@@ -72,33 +76,34 @@ enum ExitIpVerifier {
             }
         }
 
-        let latencyMs = max(1, Int(Date().timeIntervalSince(start) * 1000))
+        let latencyMs = max(1, Int((ProcessInfo.processInfo.systemUptime - start) * 1000))
 
-        guard let ip = exitIp, !ip.isEmpty, let cc = country, !cc.isEmpty else {
+        guard ProcessInfo.processInfo.systemUptime <= deadline, let ip = exitIp,
+              IPv4Address(ip) != nil || IPv6Address(ip) != nil, let cc = country,
+              cc.utf8.count == 2, cc.utf8.allSatisfy({ (65...90).contains($0) }) else {
             return ExitCheckResult(success: false, error: "代理出口探测失败: \(primaryErr ?? "无响应")")
         }
 
-        var city: String?
-        var org: String?
-        if enrichGeo, let url = URL(string: "https://ipwho.is/") {
-            let enrichSession = makeStrictlyProxiedSession(corePort: corePort, timeoutSec: 4)
-            defer { enrichSession.invalidateAndCancel() }
-            if let (data, _) = try? await enrichSession.data(from: url),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                city = obj["city"] as? String
-                if let conn = obj["connection"] as? [String: Any] {
-                    org = (conn["isp"] as? String) ?? (conn["org"] as? String)
-                }
-            }
-        }
+        let details = enrichGeo ? await geo(corePort: corePort, expectedIP: ip) : nil
 
         return ExitCheckResult(
             success: true,
             exitIp: ip,
             countryCode: cc,
-            org: org,
-            city: city,
+            org: details?.org,
+            city: details?.city,
             latencyMs: latencyMs
         )
+    }
+    static func geo(corePort: Int, expectedIP: String) async -> (city: String?, org: String?)? {
+        guard let url = URL(string: "https://ipwho.is/") else { return nil }
+        let session = makeStrictlyProxiedSession(corePort: corePort, timeoutSec: 4)
+        defer { session.invalidateAndCancel() }
+        guard let (data, response) = try? await session.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              obj["ip"] as? String == expectedIP else { return nil }
+        let connection = obj["connection"] as? [String: Any]
+        return (obj["city"] as? String, (connection?["isp"] as? String) ?? (connection?["org"] as? String))
     }
 }

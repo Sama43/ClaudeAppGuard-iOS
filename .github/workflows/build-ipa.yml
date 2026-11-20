@@ -4,7 +4,12 @@ on:
   push:
     branches: [ main, master ]
     tags: [ "v*" ]
+    paths-ignore: [ "**/*.md" ]
   workflow_dispatch:
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-ipa:
@@ -23,6 +28,12 @@ jobs:
             Tests/SubscriptionNodeMergeTests.swift \
             -o "$RUNNER_TEMP/subscription-node-merge-tests"
           "$RUNNER_TEMP/subscription-node-merge-tests"
+
+      - name: Test sealed tunnel configuration
+        run: |
+          xcrun swiftc Shared/VpnModels.swift Shared/TunnelSingBoxConfigGenerator.swift Tests/TunnelConfigTests.swift -o "$RUNNER_TEMP/tunnel-config-tests"
+          mkdir -p "$RUNNER_TEMP/guard-configs"
+          "$RUNNER_TEMP/tunnel-config-tests" "$RUNNER_TEMP/guard-configs"
 
       - name: Read Xcode cache key
         id: xcode
@@ -55,9 +66,11 @@ jobs:
         if: steps.corebridge.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v1.14.4 https://github.com/SagerNet/sing-box.git /tmp/sing-box
+          test "$(git -C /tmp/sing-box rev-parse HEAD)" = c005f35300ce76427dc285481ec5695f5b179cd2
           mkdir -p /tmp/sing-box/corebridge
-          cp corebridge/bridge.go /tmp/sing-box/corebridge/bridge.go
+          cp corebridge/*.go /tmp/sing-box/corebridge/
           cd /tmp/sing-box
+          GUARD_TEST_CONFIGS="$RUNNER_TEMP/guard-configs" go test -tags with_gvisor ./corebridge
           gomobile init
           mkdir -p "${GITHUB_WORKSPACE}/Frameworks"
           gomobile bind -v \
@@ -156,18 +169,20 @@ jobs:
         run: |
           mkdir -p build/ipa/Payload
           cp -R build/DerivedData/Build/Products/Release-iphoneos/ClaudeAppGuard.app build/ipa/Payload/
+          version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" build/ipa/Payload/ClaudeAppGuard.app/Info.plist)
+          echo "IPA_NAME=ClaudeAppGuard-iOS-v$version-unsigned.ipa" >> "$GITHUB_ENV"
           cd build/ipa
-          zip -qry "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa" Payload
-          ls -lh "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa"
+          zip -qry "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v$version-unsigned.ipa" Payload
+          ls -lh "${GITHUB_WORKSPACE}/ClaudeAppGuard-iOS-v$version-unsigned.ipa"
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ClaudeAppGuard-iOS-IPA
-          path: ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa
+          path: ${{ env.IPA_NAME }}
 
       - name: Publish GitHub Release on Tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ClaudeAppGuard-iOS-v1.0.3-unsigned.ipa
+          files: ${{ env.IPA_NAME }}

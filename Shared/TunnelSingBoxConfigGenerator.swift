@@ -86,10 +86,11 @@ enum TunnelSingBoxConfigGenerator {
         node: ProxyNode,
         probePort: Int,
         settings: VpnGuardSettings,
-        isBlackhole: Bool
+        cacheURL: URL,
+        proxyTag: String
     ) throws -> String {
         var proxyOutbound = try decodeOutbound(node)
-        proxyOutbound["tag"] = "proxy"
+        proxyOutbound["tag"] = proxyTag
         if proxyOutbound["domain_resolver"] == nil {
             proxyOutbound["domain_resolver"] = "dns_local"
         }
@@ -106,7 +107,7 @@ enum TunnelSingBoxConfigGenerator {
                 "server": "1.1.1.1",
                 "server_port": 443,
                 "path": "/dns-query",
-                "detour": "proxy"
+                "detour": proxyTag
             ],
             [
                 "tag": "dns_local",
@@ -143,52 +144,24 @@ enum TunnelSingBoxConfigGenerator {
             ["action": "sniff"],
             ["protocol": "dns", "action": "hijack-dns"],
             // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog
-            ["inbound": ["mixed-in"], "outbound": "proxy"]
+            ["inbound": ["mixed-in"], "outbound": proxyTag]
         ]
 
         let routeFinal: String
         if settings.globalMode {
             // Reject UDP 443 QUIC globally so TLS falls back cleanly to TCP
             routeRules.append(["network": "udp", "port": [443], "action": "reject"])
-            if isBlackhole {
-                routeRules.append(["inbound": ["tun-in"], "action": "reject"])
-                routeFinal = "proxy"
-            } else {
-                routeFinal = "proxy"
-            }
+            routeFinal = "guard"
         } else {
-            // Claude-Only Split Mode:
-            // Reject UDP 443 QUIC on Claude domains so official Claude iOS app uses reliable TCP TLS 1.3
-            routeRules.append([
-                "network": "udp",
-                "port": [443],
-                "domain_suffix": targetDomains,
-                "action": "reject"
-            ])
-            if isBlackhole {
-                routeRules.append([
-                    "domain_suffix": targetDomains,
-                    "action": "reject"
-                ])
-                routeRules.append([
-                    "ip_cidr": ["198.18.0.0/15", "fc00::/18"],
-                    "action": "reject"
-                ])
-            } else {
-                routeRules.append([
-                    "domain_suffix": targetDomains,
-                    "outbound": "proxy"
-                ])
-                routeRules.append([
-                    "ip_cidr": ["198.18.0.0/15", "fc00::/18"],
-                    "outbound": "proxy"
-                ])
-            }
+            routeRules.append(["network": "udp", "port": [443], "domain_suffix": targetDomains, "action": "reject"])
+            routeRules.append(["domain_suffix": targetDomains, "outbound": "guard"])
+            routeRules.append(["ip_cidr": ["198.18.0.0/15", "fc00::/18"], "outbound": "guard"])
             routeFinal = "direct"
         }
 
         let root: [String: Any] = [
-            "log": ["level": "info", "timestamp": false],
+            "experimental": ["cache_file": ["enabled": true, "path": cacheURL.path, "store_fakeip": true]],
+            "log": ["level": "warn", "timestamp": false],
             "dns": [
                 "servers": dnsServers,
                 "rules": dnsRules,
@@ -214,6 +187,9 @@ enum TunnelSingBoxConfigGenerator {
             ],
             "outbounds": [
                 proxyOutbound,
+                ["type": "block", "tag": "sealed"],
+                ["type": "selector", "tag": "guard", "outbounds": ["sealed", proxyTag],
+                 "default": "sealed", "interrupt_exist_connections": true],
                 ["type": "direct", "tag": "direct"]
             ],
             "route": [

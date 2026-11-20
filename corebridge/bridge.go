@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -27,7 +26,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func init() {
+func ConfigureTunnelMemory() {
 	// Keep Go runtime safely inside iOS NEPacketTunnelProvider's 50 MB RAM limit
 	debug.SetGCPercent(20)
 	debug.SetMemoryLimit(26 * 1024 * 1024)
@@ -48,6 +47,8 @@ var (
 	logLines     []string
 	statusMu     sync.RWMutex
 	statusJSON   string
+	statusETag   string
+	statusRevision uint64
 	statusServer *http.Server
 	statusLn     net.Listener
 )
@@ -96,11 +97,26 @@ func StartStatusServer(port int32, controlToken string, handler CommandHandler) 
 	}
 
 	tokenBytes := []byte(controlToken)
+	statusJSON = ""
+	statusETag = ""
+	authorized := func(r *http.Request) bool {
+		return len(tokenBytes) >= 16 && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CG-Token")), tokenBytes) == 1
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		statusMu.RLock()
 		body := statusJSON
+		etag := statusETag
 		statusMu.RUnlock()
+		w.Header().Set("ETag", etag)
+		if etag != "" && r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		if body == "" {
@@ -115,8 +131,7 @@ func StartStatusServer(port int32, controlToken string, handler CommandHandler) 
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		got := []byte(r.Header.Get("X-CG-Token"))
-		if len(tokenBytes) < 16 || subtle.ConstantTimeCompare(got, tokenBytes) != 1 {
+		if !authorized(r) {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -127,7 +142,7 @@ func StartStatusServer(port int32, controlToken string, handler CommandHandler) 
 		}
 		cmd := string(raw)
 		if handler != nil && cmd != "" {
-			go handler.OnControlCommand(cmd)
+			handler.OnControlCommand(cmd)
 		}
 		statusMu.RLock()
 		body := statusJSON
@@ -167,6 +182,8 @@ func StopStatusServer() {
 
 func UpdateStatusJSON(payload string) {
 	statusMu.Lock()
+	statusRevision++
+	statusETag = fmt.Sprintf("\"%d\"", statusRevision)
 	statusJSON = payload
 	statusMu.Unlock()
 }
@@ -313,7 +330,6 @@ func StartTunnelCore(configJSON string, tunFd int32) string {
 		appendLog("closing previous sing-box instance")
 		_ = activeBox.Close()
 		activeBox = nil
-		runtime.GC()
 		debug.FreeOSMemory()
 	}
 
@@ -327,13 +343,27 @@ func StartTunnelCore(configJSON string, tunFd int32) string {
 	return ""
 }
 
+// SelectGuardOutbound switches protected connections while the TUN and FakeIP mapping stay live.
+func SelectGuardOutbound(tag string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if activeBox == nil {
+		return false
+	}
+	outbound, ok := activeBox.Outbound().Outbound("guard")
+	if !ok {
+		return false
+	}
+	selector, ok := outbound.(interface{ SelectOutbound(string) bool })
+	return ok && selector.SelectOutbound(tag)
+}
+
 func StopTunnelCore() {
 	mu.Lock()
 	defer mu.Unlock()
 	if activeBox != nil {
 		_ = activeBox.Close()
 		activeBox = nil
-		runtime.GC()
 		debug.FreeOSMemory()
 		appendLog("sing-box stopped")
 	}

@@ -52,6 +52,11 @@ struct ProxyNode: Identifiable, Codable, Equatable {
     var `protocol`: ProxyProtocol
     var server: String
     var port: Int
+    var skipsTLSVerification: Bool {
+        guard let outbound = (try? JSONSerialization.jsonObject(with: Data(singBoxOutboundJson.utf8))) as? [String: Any],
+              let tls = outbound["tls"] as? [String: Any] else { return false }
+        return tls["insecure"] as? Bool == true
+    }
     var rawUri: String = ""
     var singBoxOutboundJson: String
     var subscriptionId: UUID? = nil
@@ -155,5 +160,6 @@ struct TunnelSnapshot: Codable {
     var killSwitchReason: String? = nil
     var updatedAt: Date = Date()
     var recentEvents: [SecurityEvent] = []
+    var probePort: Int? = nil
     var coreLogs: [String] = []
 }

@@ -2,6 +2,7 @@ import Foundation
 import NetworkExtension
 import UserNotifications
 import Corebridge
+import Security
 
 @MainActor
 final class VpnManagerEngine: ObservableObject {
@@ -49,6 +50,8 @@ final class VpnManagerEngine: ObservableObject {
     private var pendingAutoRetrySessionId: UUID? = nil
     private var lastAppliedSnapshotDate: Date = .distantPast
     private var currentControlToken: String = ""
+    private var snapshotETag: String?
+    private var runningNodeTests = 0
     private var refreshingSubscriptionIds = Set<UUID>()
 
     private let loopbackSession: URLSession = {
@@ -69,7 +72,6 @@ final class VpnManagerEngine: ObservableObject {
 
         requestNotificationAuth()
         loadOrCreateManager()
-        startStatusPolling()
     }
 
     private func requestNotificationAuth() {
@@ -184,12 +186,13 @@ final class VpnManagerEngine: ObservableObject {
         }
     }
 
-    private func startStatusPolling() {
+    func setForeground(_ active: Bool) {
         pollTask?.cancel()
+        guard active else { return }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_200_000_000)
-                guard let self else { break }
+                guard !Task.isCancelled, let self else { break }
                 if self.vpnStatus == .connected {
                     await self.pollLoopbackMirror()
                 }
@@ -199,21 +202,29 @@ final class VpnManagerEngine: ObservableObject {
 
     private func pollLoopbackMirror() async {
         guard let url = URL(string: "http://127.0.0.1:\(SharedConstants.statusMirrorPort)/snapshot") else { return }
-        do {
-            let (data, resp) = try await loopbackSession.data(from: url)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200, !data.isEmpty else { return }
-            let snap = try JSONDecoder().decode(TunnelSnapshot.self, from: data)
-            applyIncomingSnapshot(snap)
-        } catch {
-            // Mirror may still be booting; keep silent
+        let token = currentControlToken
+        if !token.isEmpty {
+            var request = URLRequest(url: url)
+            request.setValue(token, forHTTPHeaderField: "X-CG-Token")
+            request.setValue(snapshotETag, forHTTPHeaderField: "If-None-Match")
+            if let (data, response) = try? await loopbackSession.data(for: request),
+               let http = response as? HTTPURLResponse, token == currentControlToken, vpnStatus == .connected {
+                if http.statusCode == 304 { return }
+                if http.statusCode == 200, let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: data) {
+                    if applyIncomingSnapshot(snap) { snapshotETag = http.value(forHTTPHeaderField: "ETag") }
+                    return
+                }
+            }
         }
+        if vpnStatus == .connected, !Task.isCancelled { sendViaXpcFallback("status") }
     }
 
-    private func applyIncomingSnapshot(_ snap: TunnelSnapshot) {
-        if snap.updatedAt >= lastAppliedSnapshotDate || snap.status != snapshot.status || snap.recentEvents.count != snapshot.recentEvents.count {
-            lastAppliedSnapshotDate = snap.updatedAt
-            self.snapshot = snap
-        }
+    @discardableResult
+    private func applyIncomingSnapshot(_ snap: TunnelSnapshot) -> Bool {
+        guard vpnStatus == .connected, snap.updatedAt > lastAppliedSnapshotDate else { return false }
+        lastAppliedSnapshotDate = snap.updatedAt
+        snapshot = snap
+        return true
     }
 
     // MARK: - VPN Control
@@ -244,7 +255,13 @@ final class VpnManagerEngine: ObservableObject {
             return
         }
 
-        let freshToken = (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "")
+        var random = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else {
+            recordLocalEvent(.critical, tag: "VPN", "无法生成控制通道密钥，请重试")
+            return
+        }
+        let freshToken = Data(random).base64EncodedString()
+        snapshotETag = nil
         currentControlToken = freshToken
         let payload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: freshToken)
         guard let payloadData = try? JSONEncoder().encode(payload) else {
@@ -509,9 +526,10 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     private func syncSub(_ profile: SubscriptionProfile, isNew: Bool) async throws -> (SubscriptionProfile, Int) {
+        let activePort = vpnStatus == .connected && snapshot.status == .protected ? snapshot.probePort : nil
         let (meta, batch) = try await SubscriptionFetcher.fetchAndParse(
             urlString: profile.url,
-            activeCorePort: nil,
+            activeCorePort: activePort,
             allowDirectBootstrap: profile.allowDirectBootstrap
         )
         try Task.checkCancellation()
@@ -540,6 +558,7 @@ final class VpnManagerEngine: ObservableObject {
         storage.saveSubscriptions(subscriptions)
 
         recordLocalEvent(.success, tag: "SUB", "订阅「\(updated.name)」已更新 \(tagged.count) 个节点")
+        if affectedSessions.contains(where: { $0.id == activeSessionId }) { tripBlackholeKillSwitch() }
         if !affectedSessions.isEmpty {
             recordLocalEvent(.warn, tag: "SUB", "订阅更新后有 \(affectedSessions.count) 个身份的原节点已不存在，请重新绑定")
         }
@@ -547,6 +566,7 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     func deleteSubscription(_ subId: UUID) {
+        if let activeSession, nodes.contains(where: { $0.subscriptionId == subId && $0.id == activeSession.boundNodeId }) { tripBlackholeKillSwitch() }
         nodes.removeAll { $0.subscriptionId == subId }
         storage.saveNodes(nodes)
         subscriptions.removeAll { $0.id == subId }
@@ -554,12 +574,16 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     func deleteNode(_ nodeId: UUID) {
+        if activeSession?.boundNodeId == nodeId { tripBlackholeKillSwitch() }
         nodes.removeAll { $0.id == nodeId }
         storage.saveNodes(nodes)
     }
 
     func testNodeIsolated(_ node: ProxyNode) async -> ExitCheckResult {
-        let port = Int.random(in: 22000...45000)
+        guard runningNodeTests < 3 else { return ExitCheckResult(success: false, error: "已有 3 个测速任务，请稍后再试") }
+        runningNodeTests += 1
+        defer { runningNodeTests -= 1 }
+        guard let port = try? LoopbackPort.allocate() else { return ExitCheckResult(success: false, error: "无法分配本地测速端口") }
         guard let cfg = try? TunnelSingBoxConfigGenerator.generateStandaloneProbe(node: node, corePort: port) else {
             return ExitCheckResult(success: false, error: "节点配置生成失败")
         }
@@ -570,9 +594,10 @@ final class VpnManagerEngine: ObservableObject {
             return ExitCheckResult(success: false, error: resp.replacingOccurrences(of: "ERR:", with: ""))
         }
         let handle = String(resp.dropFirst(3))
-        defer { Task.detached { CorebridgeStopTempCore(handle) } }
+
         try? await Task.sleep(nanoseconds: 250_000_000)
         let check = await ExitIpVerifier.verify(corePort: port, enrichGeo: true, timeoutSec: 8)
+        await Task.detached { CorebridgeStopTempCore(handle) }.value
         if check.success, let idx = nodes.firstIndex(where: { $0.id == node.id }) {
             nodes[idx].lastLatencyMs = check.latencyMs
             nodes[idx].lastExitIp = check.exitIp

@@ -9,7 +9,15 @@ struct SubscriptionFetchMeta {
     let fetchedViaProxy: Bool
 }
 
+private final class HTTPSRedirects: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(request.url?.scheme?.lowercased() == "https" ? request : nil)
+    }
+}
+
 enum SubscriptionFetcher {
+    private static let maximumBytes = 8 * 1024 * 1024
 
     private static let userAgents = ["clash-verge/v2.0.0", "v2rayNG/1.9.25"]
 
@@ -19,9 +27,9 @@ enum SubscriptionFetcher {
         allowDirectBootstrap: Bool
     ) async throws -> (SubscriptionFetchMeta, ParseBatchResult) {
         guard let url = URL(string: urlString),
-              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              url.scheme?.lowercased() == "https",
               let host = url.host, !host.isEmpty else {
-            throw NSError(domain: "SubFetcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "请输入有效的 http:// 或 https:// 订阅链接"])
+            throw NSError(domain: "SubFetcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "请输入有效的 HTTPS 订阅链接"])
         }
 
         let useProxy = (activeCorePort ?? 0) > 0
@@ -47,11 +55,17 @@ enum SubscriptionFetcher {
                 req.setValue(ua, forHTTPHeaderField: "User-Agent")
                 req.setValue("*/*", forHTTPHeaderField: "Accept")
 
-                let (data, resp) = try await session.data(for: req)
+                let (bytes, resp) = try await session.bytes(for: req, delegate: HTTPSRedirects())
                 try Task.checkCancellation()
                 guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
                     throw NSError(domain: "SubFetcher", code: code, userInfo: [NSLocalizedDescriptionKey: "HTTP \(code)"])
+                }
+                guard resp.expectedContentLength <= Int64(maximumBytes) else { throw URLError(.dataLengthExceedsMaximum) }
+                var data = Data()
+                for try await byte in bytes {
+                    guard data.count < maximumBytes else { throw URLError(.dataLengthExceedsMaximum) }
+                    data.append(byte)
                 }
                 guard let body = String(data: data, encoding: .utf8), !body.isEmpty else {
                     throw NSError(domain: "SubFetcher", code: 3, userInfo: [NSLocalizedDescriptionKey: "订阅返回空内容"])
@@ -72,6 +86,8 @@ enum SubscriptionFetcher {
                     return (meta, parsed)
                 }
                 lastError = parsed.errors.first ?? "未解析到有效节点"
+            } catch let error as URLError where error.code == .dataLengthExceedsMaximum {
+                throw NSError(domain: "SubFetcher", code: 5, userInfo: [NSLocalizedDescriptionKey: "订阅超过 8 MiB 上限"])
             } catch {
                 try Task.checkCancellation()
                 lastError = error.localizedDescription

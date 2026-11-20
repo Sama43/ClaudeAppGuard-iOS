@@ -38,7 +38,12 @@ final class SharedStorage {
     func saveSettings(_ s: VpnGuardSettings) { save(s, forKey: Keys.settings) }
 
     func loadSnapshot() -> TunnelSnapshot { load(Keys.snapshot) ?? TunnelSnapshot() }
-    func saveSnapshot(_ snap: TunnelSnapshot) { save(snap, forKey: Keys.snapshot) }
+    func saveSnapshot(_ snap: TunnelSnapshot) {
+        var stored = snap
+        stored.coreLogs = []
+        stored.probePort = nil
+        save(stored, forKey: Keys.snapshot)
+    }
 
     private func load<T: Decodable>(_ key: String) -> T? {
         guard let data = defaults.data(forKey: key) else { return nil }

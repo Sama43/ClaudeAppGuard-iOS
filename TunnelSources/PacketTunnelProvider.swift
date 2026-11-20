@@ -16,128 +16,329 @@ private final class TunnelCmdBridge: NSObject, CorebridgeCommandHandlerProtocol 
     }
 }
 
-/// iOS NEPacketTunnelProvider for Official Claude iOS App Isolation with Fail-Closed Blackhole Kill-Switch.
-///
-/// Lifecycle:
-/// 1. Starts loopback status+control mirror (127.0.0.1:49271) + configures utun (172.19.0.1/30, DNS 172.19.0.2, MTU 4064).
-/// 2. Immediately starts sing-box in BLACKHOLE MODE FIRST (all Claude domains -> action="reject") -> 0 startup leak!
-/// 3. Verifies Exit IP & Country strictly via local mixed-in (127.0.0.1:<probePort>).
-/// 4. ONLY on passing all region & IP-pin rules -> hot-swaps sing-box into PROTECTED MODE (FakeIP 198.18.0.0/15, 0 overlap!).
-/// 5. Runs a 5-second Watchdog (configurable 3s/5s/10s/20s, 4s timeout) + NWPathMonitor in background;
-///    on ANY anomaly, immediately hot-swaps back to BLACKHOLE MODE & posts a local notification!
 final class PacketTunnelProvider: NEPacketTunnelProvider {
-
+    // All lifecycle callbacks, commands, and completed probes are committed on this queue.
+    private let queue = DispatchQueue(label: "com.claudeguard.tunnel")
     private let storage = SharedStorage()
-    private let pathMonitor = NWPathMonitor()
-    private let pathQueue = DispatchQueue(label: "com.claudeguard.iosvpn.tunnel.path")
-    private let stateLock = NSLock()
+    private var monitor: NWPathMonitor?
+    private var checkTask: Task<Void, Never>?
+    private var geoTask: Task<Void, Never>?
+    private var generation: UInt64 = 0
+    private var manuallyLocked = false
+    private var offline = false
+    private var lastInterface: NWInterface.InterfaceType?
+    private var transientFailures = 0
+    private var retryIndex = 0
     private var cmdBridge: TunnelCmdBridge?
-
     private var utunFd: Int32 = -1
-    private var probePort: Int = 18088
+    private var probePort = 0
+    private var proxyTag = ""
     private var currentNode: ProxyNode?
     private var currentSession: AppIdentitySession?
-    private var settings: VpnGuardSettings = VpnGuardSettings()
-    private var snapshot: TunnelSnapshot = TunnelSnapshot()
-
-    private var watchdogTask: Task<Void, Never>?
-    private var verifyTask: Task<Void, Never>?
-    private var logPumpTask: Task<Void, Never>?
-    private var lastInterface: NWInterface.InterfaceType?
-    private var isBlackholeActive = true
+    private var settings = VpnGuardSettings()
+    private var snapshot = TunnelSnapshot()
+    private var encodedSnapshot: Data?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        let payload = resolveLaunchPayload(options: options)
-
-        let bridge = TunnelCmdBridge(owner: self)
-        self.cmdBridge = bridge
-        _ = CorebridgeStartStatusServer(
-            SharedConstants.statusMirrorPort,
-            payload?.controlToken ?? "",
-            bridge
-        )
-
-        let targetNode: ProxyNode
-        let session: AppIdentitySession?
-
-        if let payload {
-            self.settings = payload.settings
-            targetNode = payload.node
-            session = payload.session
-        } else {
-            self.settings = storage.loadSettings()
-            let nodes = storage.loadNodes()
-            let sessions = storage.loadSessions()
-            let activeSessionId = storage.loadActiveSessionId()
-            session = activeSessionId.flatMap { id in sessions.first { $0.id == id } } ?? sessions.first
-            let fallbackNode: ProxyNode?
-            if let s = session {
-                fallbackNode = nodes.first { $0.id == s.boundNodeId }
-            } else {
-                fallbackNode = nodes.first
-            }
-            guard let resolved = fallbackNode else {
-                let err = NSError(domain: "ClaudeAppGuard", code: 1, userInfo: [NSLocalizedDescriptionKey: "未找到可用代理节点（providerConfiguration 与 App Group 均为空），请返回主 App 重新点击开启"])
-                recordEvent(.critical, tag: "TUN", err.localizedDescription)
-                completionHandler(err)
+        queue.async {
+            self.invalidateChecks()
+            let startup = self.generation
+            let payload = self.resolveLaunchPayload(options: options)
+            self.settings = payload?.settings ?? self.storage.loadSettings()
+            let savedId = self.storage.loadActiveSessionId()
+            self.currentSession = payload?.session ?? self.storage.loadSessions().first { $0.id == savedId }
+            let nodeId = self.currentSession?.boundNodeId
+            self.currentNode = payload?.node ?? self.storage.loadNodes().first { $0.id == nodeId }
+            self.manuallyLocked = false
+            self.offline = false
+            self.lastInterface = nil
+            self.retryIndex = 0
+            self.transientFailures = 0
+            guard let node = self.currentNode else {
+                completionHandler(self.failure("未找到已绑定节点，请返回 App 重新选择"))
                 return
             }
-            targetNode = resolved
+            self.snapshot = TunnelSnapshot(status: .startingCore, activeSessionId: self.currentSession?.id,
+                                          activeSessionName: self.currentSession?.name, activeNodeName: node.name)
+            self.setTunnelNetworkSettings(self.buildTunnelNetworkSettings()) { error in
+                self.queue.async {
+                    guard self.generation == startup else {
+                        completionHandler(CancellationError())
+                        return
+                    }
+                    if let error { completionHandler(error); return }
+                    var fd = CorebridgeFindUtunFileDescriptor()
+                    if fd < 0 { fd = (self.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32) ?? -1 }
+                    guard fd >= 0 else { completionHandler(self.failure("无法获取系统 utun 文件描述符")); return }
+                    self.utunFd = fd
+                    do {
+                        self.probePort = try LoopbackPort.allocate()
+                        CorebridgeConfigureTunnelMemory()
+                        try self.startSealedCore()
+                    } catch {
+                        self.utunFd = -1
+                        self.snapshot.status = .stopped
+                        self.recordEvent(.critical, tag: "CORE", error.localizedDescription)
+                        completionHandler(error)
+                        return
+                    }
+                    let bridge = TunnelCmdBridge(owner: self)
+                    self.cmdBridge = bridge
+                    if let token = payload?.controlToken, !token.isEmpty {
+                        let error = CorebridgeStartStatusServer(SharedConstants.statusMirrorPort, token, bridge)
+                        if !error.isEmpty { self.recordEvent(.warn, tag: "IPC", "本地状态服务不可用，使用系统 IPC") }
+                    }
+                    self.startPathMonitor()
+                    self.beginVerification()
+                    completionHandler(nil)
+                }
+            }
         }
+    }
 
-        self.currentSession = session
-        self.currentNode = targetNode
-        self.probePort = allocateLoopbackPort()
-        withState {
-            self.snapshot = TunnelSnapshot(
-                status: .startingCore,
-                activeSessionId: session?.id,
-                activeSessionName: session?.name,
-                activeNodeName: targetNode.name
-            )
+    private func failure(_ description: String) -> NSError {
+        NSError(domain: "ClaudeAppGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: description])
+    }
+
+    private func startSealedCore() throws {
+        guard let node = currentNode else { throw failure("节点已移除，请重新绑定") }
+        let directory = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("ClaudeAppGuard", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // sing-box restores a selector's previous choice before applying its default.
+        // Only the sealed tag may match a choice made by a previous core instance.
+        proxyTag = "proxy-" + UUID().uuidString
+        let config = try TunnelSingBoxConfigGenerator.generateTunnelConfig(node: node, probePort: probePort,
+            settings: settings, cacheURL: directory.appendingPathComponent("cache.db"), proxyTag: proxyTag)
+        let error = CorebridgeStartTunnelCore(config, utunFd)
+        if !error.isEmpty { throw failure("sing-box 启动失败：\(error)") }
+    }
+
+    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        queue.async {
+            self.invalidateChecks()
+            self.monitor?.cancel()
+            self.monitor = nil
+            self.utunFd = -1
+            CorebridgeStopTunnelCore()
+            self.snapshot.status = .stopped
+            self.snapshot.killSwitchReason = nil
+            self.recordEvent(.info, tag: "TUN", "隔离 VPN 已停止")
+            CorebridgeStopStatusServer()
+            self.cmdBridge = nil
+            completionHandler()
         }
-        recordEvent(.info, tag: "TUN", "正在建立 iOS 隔离隧道 -> \(targetNode.name) (\(targetNode.server):\(targetNode.port))")
+    }
 
-        let netSettings = buildTunnelNetworkSettings()
-        setTunnelNetworkSettings(netSettings) { [weak self] error in
-            guard let self else { return }
-            if let error {
-                self.recordEvent(.critical, tag: "TUN", "配置 TUN 网络失败: \(error.localizedDescription)")
-                completionHandler(error)
-                return
-            }
+    func processControlCommand(_ cmd: String) {
+        queue.async { self.handleCommand(cmd) }
+    }
 
-            // Acquire iOS utun file descriptor
-            var fd = CorebridgeFindUtunFileDescriptor()
-            if fd < 0 {
-                fd = (self.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32) ?? -1
-            }
-            guard fd >= 0 else {
-                let err = NSError(domain: "ClaudeAppGuard", code: 2, userInfo: [NSLocalizedDescriptionKey: "无法获取系统 utun 文件描述符"])
-                self.recordEvent(.critical, tag: "TUN", err.localizedDescription)
-                completionHandler(err)
-                return
-            }
-            self.utunFd = fd
-            self.recordEvent(.info, tag: "TUN", "已接管系统 utun (fd=\(fd), TUN=172.19.0.1/30, DNS=172.19.0.2)")
-
-            // Step 1: IMMEDIATELY start sing-box in BLACKHOLE MODE FIRST (zero startup leak!)
-            let blackholeErr = self.applySingBoxMode(isBlackhole: true)
-            if let blackholeErr {
-                completionHandler(NSError(domain: "ClaudeAppGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: "sing-box 启动失败: \(blackholeErr)"]))
-                return
-            }
-
-            // Signal iOS that VPN tunnel is UP (currently sealed in Blackhole mode!)
-            completionHandler(nil)
-
-            // Start network switch / drop monitor + live log mirror pump
-            self.startPathMonitor()
-            self.startLogPump()
-
-            // Step 2: Verify Exit IP & Country strictly via probePort BEFORE opening Claude access!
-            self.triggerVerification(enrichGeo: true)
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        let cmd = String(data: messageData, encoding: .utf8) ?? ""
+        queue.async {
+            self.handleCommand(cmd)
+            completionHandler?(self.encodedSnapshot)
         }
+    }
+
+    private func handleCommand(_ cmd: String) {
+        guard utunFd >= 0 else { return }
+        switch cmd {
+        case "status": return
+        case "kill_switch":
+            lockTraffic("已手动熔断，请手动重新校验", manual: true)
+        case "reverify":
+            manuallyLocked = false
+            guard seal() else { return }
+            beginVerification()
+        case "reload":
+            guard let session = storage.loadSessions().first(where: { $0.id == storage.loadActiveSessionId() }),
+                  let node = storage.loadNodes().first(where: { $0.id == session.boundNodeId }) else {
+                lockTraffic("已绑定节点不存在，请重新绑定", manual: true)
+                return
+            }
+            reload(node: node, session: session, settings: storage.loadSettings())
+        default:
+            guard cmd.hasPrefix("reload_payload:"),
+                  let data = Data(base64Encoded: String(cmd.dropFirst("reload_payload:".count))),
+                  let payload = try? JSONDecoder().decode(TunnelLaunchPayload.self, from: data) else { return }
+            reload(node: payload.node, session: payload.session, settings: payload.settings)
+        }
+    }
+
+    private func reload(node: ProxyNode, session: AppIdentitySession?, settings newSettings: VpnGuardSettings) {
+        invalidateChecks()
+        guard seal() else { return }
+        let rebuild = currentNode?.singBoxOutboundJson != node.singBoxOutboundJson
+            || settings.globalMode != newSettings.globalMode || settings.includeAuthHelperDomains != newSettings.includeAuthHelperDomains
+        settings = newSettings
+        currentNode = node
+        currentSession = session
+        snapshot.activeSessionId = session?.id
+        snapshot.activeSessionName = session?.name
+        snapshot.activeNodeName = node.name
+        if rebuild {
+            do { try startSealedCore() }
+            catch {
+                CorebridgeStopTunnelCore()
+                lockTraffic(error.localizedDescription, manual: true)
+                return
+            }
+        }
+        if manuallyLocked { publish(); return }
+        beginVerification()
+    }
+
+    private func invalidateChecks() {
+        generation &+= 1
+        checkTask?.cancel()
+        geoTask?.cancel()
+    }
+
+    private func seal() -> Bool {
+        if !CorebridgeIsRunning() || CorebridgeSelectGuardOutbound("sealed") { return true }
+        CorebridgeStopTunnelCore()
+        invalidateChecks()
+        manuallyLocked = true
+        snapshot.status = .blackholeKillSwitch
+        snapshot.killSwitchReason = "切换封锁模式失败，内核已停止，请重新校验"
+        recordEvent(.critical, tag: "CORE", snapshot.killSwitchReason!)
+        return false
+    }
+
+    private func lockTraffic(_ reason: String, manual: Bool, notify: Bool = true) {
+        invalidateChecks()
+        manuallyLocked = manual
+        guard seal() else { return }
+        let changed = snapshot.status != .blackholeKillSwitch || snapshot.killSwitchReason != reason
+        snapshot.status = .blackholeKillSwitch
+        snapshot.killSwitchReason = reason
+        if changed {
+            recordEvent(.warn, tag: "KILL_SWITCH", reason)
+            if notify { postKillSwitchNotification(reason: reason) }
+        }
+    }
+
+    private func beginVerification() {
+        invalidateChecks()
+        guard !manuallyLocked else { return }
+        if offline { lockTraffic("网络已断开，等待恢复后校验", manual: false, notify: false); return }
+        if !CorebridgeIsRunning() {
+            do { try startSealedCore() }
+            catch { lockTraffic(error.localizedDescription, manual: true); return }
+        }
+        retryIndex = 0
+        transientFailures = 0
+        snapshot.status = .verifyingExit
+        snapshot.killSwitchReason = nil
+        recordEvent(.info, tag: "VERIFY", "正在通过已绑定节点校验出口")
+        scheduleCheck(after: 0)
+    }
+
+    private func scheduleCheck(after delay: Int) {
+        let ticket = generation
+        let port = probePort
+        checkTask = Task {
+            do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
+            catch { return }
+            let result = await ExitIpVerifier.verify(corePort: port, enrichGeo: false, timeoutSec: 4)
+            guard !Task.isCancelled else { return }
+            self.queue.async {
+                guard ticket == self.generation, !self.offline, !self.manuallyLocked else { return }
+                self.applyCheck(result)
+            }
+        }
+    }
+
+    private func applyCheck(_ result: ExitCheckResult) {
+        let wasProtected = snapshot.status == .protected
+        guard result.success, let ip = result.exitIp, let country = result.countryCode else {
+            transientFailures += 1
+            if wasProtected && transientFailures == 1 {
+                recordEvent(.warn, tag: "VERIFY", "出口巡检未响应，正在复查")
+                scheduleCheck(after: 0)
+                return
+            }
+            lockTraffic("出口暂时不可验证，将自动重试", manual: false)
+            let delays = [3, 6, 12, 30]
+            scheduleCheck(after: delays[retryIndex])
+            retryIndex = min(retryIndex + 1, delays.count - 1)
+            return
+        }
+        let ipChanged = snapshot.exitIp != ip
+        snapshot.exitIp = ip
+        snapshot.exitCountry = country
+        snapshot.latencyMs = result.latencyMs
+        if ipChanged { snapshot.exitCity = nil; snapshot.exitOrg = nil }
+        if let violation = evaluatePolicyViolation(exitIp: ip, countryCode: country) {
+            lockTraffic(violation, manual: true)
+            return
+        }
+        if !wasProtected {
+            guard CorebridgeSelectGuardOutbound(proxyTag) else {
+                lockTraffic("无法启用已校验出口，请重新校验", manual: true)
+                return
+            }
+            snapshot.status = .protected
+            snapshot.killSwitchReason = nil
+            recordEvent(.success, tag: "PROTECTED", "出口校验通过 \(country) · \(ip)")
+        } else { publish(persist: false) }
+        if !wasProtected || ipChanged {
+            let ticket = generation
+            let port = probePort
+            geoTask?.cancel()
+            geoTask = Task {
+                guard let geo = await ExitIpVerifier.geo(corePort: port, expectedIP: ip), !Task.isCancelled else { return }
+                self.queue.async {
+                    guard self.generation == ticket, self.snapshot.exitIp == ip else { return }
+                    self.snapshot.exitCity = geo.city
+                    self.snapshot.exitOrg = geo.org
+                    self.publish(persist: false)
+                }
+            }
+        }
+        transientFailures = 0
+        retryIndex = 0
+        scheduleCheck(after: max(3, min(120, settings.watchdogIntervalSec)))
+    }
+
+    private func startPathMonitor() {
+        let next = NWPathMonitor()
+        monitor = next
+        next.pathUpdateHandler = { [weak self, weak next] path in
+            guard let self, let next, self.monitor === next else { return }
+            let interface = path.availableInterfaces.first { $0.type != .other && path.usesInterfaceType($0.type) }?.type
+            let wasOffline = self.offline
+            self.offline = path.status != .satisfied
+            let switched = self.lastInterface != nil && interface != self.lastInterface
+            if !self.offline { self.lastInterface = interface }
+            guard !self.manuallyLocked else { return }
+            if self.offline {
+                if !wasOffline { self.lockTraffic("网络已断开，等待恢复后校验", manual: false) }
+            } else if wasOffline || (switched && self.settings.killOnNetworkChange) {
+                guard self.seal() else { return }
+                self.beginVerification()
+            }
+        }
+        next.start(queue: queue)
+    }
+
+    private func recordEvent(_ level: EventLevel, tag: String, _ message: String) {
+        snapshot.recentEvents.insert(SecurityEvent(level: level, tag: tag, message: message), at: 0)
+        snapshot.recentEvents = Array(snapshot.recentEvents.prefix(100))
+        publish()
+    }
+
+    private func publish(persist: Bool = true) {
+        snapshot.updatedAt = Date()
+        if persist { storage.saveSnapshot(snapshot) }
+        var live = snapshot
+        let raw = CorebridgeGetLogs()
+        live.probePort = snapshot.status == .protected ? probePort : nil
+        live.coreLogs = raw.isEmpty ? [] : raw.components(separatedBy: .newlines)
+        encodedSnapshot = try? JSONEncoder().encode(live)
+        if let data = encodedSnapshot { CorebridgeUpdateStatusJSON(String(decoding: data, as: UTF8.self)) }
     }
 
     private func resolveLaunchPayload(options: [String: NSObject]?) -> TunnelLaunchPayload? {
@@ -152,218 +353,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return decoded
         }
         return nil
-    }
-
-    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
-        watchdogTask?.cancel()
-        verifyTask?.cancel()
-        logPumpTask?.cancel()
-        pathMonitor.cancel()
-        CorebridgeStopTunnelCore()
-        withState {
-            snapshot.status = .stopped
-            snapshot.killSwitchReason = nil
-        }
-        recordEvent(.info, tag: "TUN", "隔离 VPN 已停止")
-        CorebridgeStopStatusServer()
-        cmdBridge = nil
-        completionHandler()
-    }
-
-    /// Handles control commands arriving from EITHER Apple XPC (handleAppMessage) OR authenticated loopback POST /cmd.
-    func processControlCommand(_ cmd: String) {
-        if cmd.hasPrefix("reload_payload:") {
-            let b64 = String(cmd.dropFirst("reload_payload:".count))
-            if let raw = Data(base64Encoded: b64),
-               let payload = try? JSONDecoder().decode(TunnelLaunchPayload.self, from: raw) {
-                withState {
-                    self.settings = payload.settings
-                    self.currentSession = payload.session
-                    self.currentNode = payload.node
-                    self.snapshot.status = .verifyingExit
-                    self.snapshot.activeSessionId = payload.session?.id
-                    self.snapshot.activeSessionName = payload.session?.name
-                    self.snapshot.activeNodeName = payload.node.name
-                    self.snapshot.killSwitchReason = nil
-                }
-                recordEvent(.info, tag: "IDENTITY", "正在切换隔离身份/策略 -> \(payload.session?.name ?? payload.node.name)")
-                Task.detached(priority: .userInitiated) { [weak self] in
-                    guard let self else { return }
-                    _ = self.applySingBoxMode(isBlackhole: true)
-                    self.triggerVerification(enrichGeo: true)
-                }
-                return
-            }
-        }
-
-        switch cmd {
-        case "kill_switch":
-            engageBlackholeKillSwitch(reason: "已手动触发黑洞熔断（官方 Claude 流量已彻底封锁）", sendPush: false)
-
-        case "reverify":
-            withState {
-                self.snapshot.status = .verifyingExit
-                self.snapshot.killSwitchReason = nil
-            }
-            persistSnapshot()
-            triggerVerification(enrichGeo: true)
-
-        case "reload":
-            withState {
-                self.snapshot.status = .verifyingExit
-            }
-            persistSnapshot()
-            Task.detached(priority: .userInitiated) { [weak self] in
-                guard let self else { return }
-                self.reloadConfigFromStorage()
-                self.triggerVerification(enrichGeo: true)
-            }
-
-        default:
-            persistSnapshot()
-        }
-    }
-
-    /// Always replies IMMEDIATELY (< 1ms) so XPC sendProviderMessage NEVER blocks or times out.
-    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        let cmd = String(data: messageData, encoding: .utf8) ?? ""
-        if cmd != "status" && !cmd.isEmpty {
-            processControlCommand(cmd)
-        } else {
-            persistSnapshot()
-        }
-        completionHandler?(encodeSnapshot())
-    }
-
-    private func triggerVerification(enrichGeo: Bool) {
-        verifyTask?.cancel()
-        verifyTask = Task { [weak self] in
-            guard let self else { return }
-            await self.verifyAndActivateIfSafe(enrichGeo: enrichGeo)
-        }
-    }
-
-    private func startLogPump() {
-        logPumpTask?.cancel()
-        logPumpTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard let self else { break }
-                self.persistSnapshot()
-            }
-        }
-    }
-
-    // MARK: - Fail-Closed Blackhole & Verification Logic
-
-    private func reloadConfigFromStorage() {
-        self.settings = storage.loadSettings()
-        let nodes = storage.loadNodes()
-        let sessions = storage.loadSessions()
-        let sid = storage.loadActiveSessionId()
-        let sess = sid.flatMap { id in sessions.first { $0.id == id } }
-        self.currentSession = sess
-        if let s = sess, let n = nodes.first(where: { $0.id == s.boundNodeId }) {
-            self.currentNode = n
-            withState {
-                snapshot.activeSessionId = s.id
-                snapshot.activeSessionName = s.name
-                snapshot.activeNodeName = n.name
-            }
-        }
-        _ = applySingBoxMode(isBlackhole: true)
-    }
-
-    private func applySingBoxMode(isBlackhole: Bool) -> String? {
-        guard let node = currentNode, utunFd >= 0 else { return "缺少节点或 utun fd" }
-        do {
-            let cfg = try TunnelSingBoxConfigGenerator.generateTunnelConfig(
-                node: node,
-                probePort: probePort,
-                settings: settings,
-                isBlackhole: isBlackhole
-            )
-            let err = CorebridgeStartTunnelCore(cfg, utunFd)
-            if !err.isEmpty {
-                recordEvent(.critical, tag: "CORE", "sing-box 启动失败: \(err)")
-                return err
-            }
-            self.isBlackholeActive = isBlackhole
-            persistSnapshot()
-            return nil
-        } catch {
-            return error.localizedDescription
-        }
-    }
-
-    private func verifyAndActivateIfSafe(enrichGeo: Bool) async {
-        withState {
-            snapshot.status = .verifyingExit
-            snapshot.killSwitchReason = nil
-        }
-        recordEvent(.info, tag: "VERIFY", "黑洞锁定下正在通过节点校验海外出口 IP...")
-
-        if !CorebridgeIsRunning() {
-            if let err = applySingBoxMode(isBlackhole: true) {
-                engageBlackholeKillSwitch(reason: "代理内核启动失败: \(err)", sendPush: true)
-                return
-            }
-        }
-
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        if Task.isCancelled { return }
-
-        let check = await ExitIpVerifier.verify(corePort: probePort, enrichGeo: enrichGeo, timeoutSec: enrichGeo ? 8 : 4)
-        if Task.isCancelled { return }
-
-        guard check.success, let ip = check.exitIp, let cc = check.countryCode else {
-            engageBlackholeKillSwitch(reason: "代理链路中断或超时：\(check.error ?? "无响应")（已切入黑洞封锁官方 Claude，零直连）", sendPush: true)
-            return
-        }
-
-        if let violation = evaluatePolicyViolation(exitIp: ip, countryCode: cc) {
-            withState {
-                snapshot.exitIp = ip
-                snapshot.exitCountry = cc
-                snapshot.latencyMs = check.latencyMs
-            }
-            engageBlackholeKillSwitch(reason: violation, sendPush: true)
-            return
-        }
-
-        // All checks PASSED -> switch sing-box from Blackhole to Protected Mode if needed
-        if isBlackholeActive {
-            if let err = applySingBoxMode(isBlackhole: false) {
-                engageBlackholeKillSwitch(reason: "切换放行模式失败: \(err)", sendPush: true)
-                return
-            }
-        }
-
-        withState {
-            snapshot.status = .protected
-            snapshot.exitIp = ip
-            snapshot.exitCountry = cc
-            snapshot.exitCity = check.city ?? snapshot.exitCity
-            snapshot.exitOrg = check.org ?? snapshot.exitOrg
-            snapshot.latencyMs = check.latencyMs
-            snapshot.killSwitchReason = nil
-        }
-        recordEvent(.success, tag: "PROTECTED", "出口校验通过 -> \(cc) · \(ip) (\(check.latencyMs ?? 0)ms)")
-
-        startWatchdogLoop()
-    }
-
-    private func engageBlackholeKillSwitch(reason: String, sendPush: Bool) {
-        watchdogTask?.cancel()
-        _ = applySingBoxMode(isBlackhole: true)
-        withState {
-            snapshot.status = .blackholeKillSwitch
-            snapshot.killSwitchReason = reason
-        }
-        recordEvent(.critical, tag: "KILL_SWITCH", reason)
-        if sendPush {
-            postKillSwitchNotification(reason: reason)
-        }
     }
 
     private func evaluatePolicyViolation(exitIp: String, countryCode: String) -> String? {
@@ -383,62 +372,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return nil
     }
 
-    private func startWatchdogLoop() {
-        watchdogTask?.cancel()
-        watchdogTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { break }
-                let sec = max(3, min(120, self.settings.watchdogIntervalSec))
-                try? await Task.sleep(nanoseconds: UInt64(sec) * 1_000_000_000)
-                if Task.isCancelled { break }
-                let currentStatus = self.withState { self.snapshot.status }
-                if currentStatus != .protected { break }
-                if !CorebridgeIsRunning() {
-                    self.engageBlackholeKillSwitch(reason: "后台巡检发现代理内核停止，已切入黑洞熔断", sendPush: true)
-                    break
-                }
-                let check = await ExitIpVerifier.verify(corePort: self.probePort, enrichGeo: false, timeoutSec: 4)
-                guard check.success, let ip = check.exitIp, let cc = check.countryCode else {
-                    self.engageBlackholeKillSwitch(reason: "5秒巡检超时/断线（\(check.error ?? "无响应")），已瞬时黑洞封锁官方 Claude", sendPush: true)
-                    break
-                }
-                if let violation = self.evaluatePolicyViolation(exitIp: ip, countryCode: cc) {
-                    self.engageBlackholeKillSwitch(reason: violation, sendPush: true)
-                    break
-                }
-                self.withState {
-                    self.snapshot.exitIp = ip
-                    self.snapshot.exitCountry = cc
-                    self.snapshot.latencyMs = check.latencyMs
-                }
-                self.persistSnapshot()
-            }
-        }
-    }
-
-    private func startPathMonitor() {
-        pathMonitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
-            let cur = path.availableInterfaces.first { $0.type != .other }?.type
-            let prev = self.lastInterface
-            self.lastInterface = cur
-
-            let currentStatus = self.withState { self.snapshot.status }
-            if path.status != .satisfied {
-                if currentStatus == .protected {
-                    self.engageBlackholeKillSwitch(reason: "检测到物理网络断开！已瞬时黑洞封锁官方 Claude，零直连", sendPush: true)
-                }
-                return
-            }
-
-            if let prev, let cur, prev != cur, self.settings.killOnNetworkChange, currentStatus == .protected {
-                self.engageBlackholeKillSwitch(reason: "检测到 Wi-Fi/蜂窝切换，正在黑洞保护下重新校验出口...", sendPush: false)
-                self.triggerVerification(enrichGeo: true)
-            }
-        }
-        pathMonitor.start(queue: pathQueue)
-    }
-
     private func buildTunnelNetworkSettings() -> NEPacketTunnelNetworkSettings {
         let net = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         net.mtu = 4064
@@ -446,17 +379,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Official sing-box iOS TUN addressing (172.19.0.1/30, DNS 172.19.0.2) — 100% disjoint from FakeIP 198.18.0.0/15!
         let ipv4 = NEIPv4Settings(addresses: ["172.19.0.1"], subnetMasks: ["255.255.255.252"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        var excludedV4 = [
-            NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0")
-        ]
-        if !settings.globalMode {
-            // Note: Do NOT exclude 172.16.0.0/12 so 172.19.0.2 DNS always enters utun!
-            excludedV4.append(contentsOf: [
-                NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.0.0.0"),
-                NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0")
-            ])
-        }
-        ipv4.excludedRoutes = excludedV4
+        // Keep system routes stable across live policy changes. Split-mode LAN traffic uses the direct outbound.
+        ipv4.excludedRoutes = [NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0")]
         net.ipv4Settings = ipv4
 
         let ipv6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::1"], networkPrefixLengths: [126])
@@ -476,75 +400,5 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         content.sound = .default
         let req = UNNotificationRequest(identifier: "cg_kill_switch", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
-    }
-
-    @discardableResult
-    private func withState<T>(_ body: () -> T) -> T {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return body()
-    }
-
-    private func recordEvent(_ level: EventLevel, tag: String, _ message: String) {
-        withState {
-            snapshot.recentEvents.insert(SecurityEvent(level: level, tag: tag, message: message), at: 0)
-            if snapshot.recentEvents.count > 100 {
-                snapshot.recentEvents = Array(snapshot.recentEvents.prefix(100))
-            }
-        }
-        persistSnapshot()
-    }
-
-    private func persistSnapshot() {
-        let logs = currentCoreLogs()
-        let snapCopy: TunnelSnapshot = withState {
-            snapshot.coreLogs = logs
-            snapshot.updatedAt = Date()
-            return snapshot
-        }
-        storage.saveSnapshot(snapCopy)
-        if let data = try? JSONEncoder().encode(snapCopy),
-           let jsonStr = String(data: data, encoding: .utf8) {
-            CorebridgeUpdateStatusJSON(jsonStr)
-        }
-    }
-
-    private func encodeSnapshot() -> Data? {
-        let logs = currentCoreLogs()
-        let snapCopy: TunnelSnapshot = withState {
-            snapshot.coreLogs = logs
-            return snapshot
-        }
-        return try? JSONEncoder().encode(snapCopy)
-    }
-
-    private func currentCoreLogs() -> [String] {
-        let raw = CorebridgeGetLogs()
-        return raw.isEmpty ? [] : raw.components(separatedBy: .newlines)
-    }
-
-    private func allocateLoopbackPort() -> Int {
-        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return 18088 }
-        defer { Darwin.close(fd) }
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let ok = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if ok != 0 { return 18088 }
-        var out = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        _ = withUnsafeMutablePointer(to: &out) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.getsockname(fd, $0, &len)
-            }
-        }
-        return Int(UInt16(bigEndian: out.sin_port))
     }
 }

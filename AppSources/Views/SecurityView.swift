@@ -12,7 +12,7 @@ struct SecurityView: View {
                 Section("PacketTunnel 隔离状态") {
                     row("系统 VPN 状态", engine.vpnStatusText, engine.vpnStatus == .connected)
                     row("扩展 Bundle ID", engine.resolvedExtensionId, true)
-                    row("配置通道", engine.appGroupAvailable ? "App Group + 环回加密控制" : "环回加密直传（兼容重签）", true)
+                    row("配置通道", engine.appGroupAvailable ? "App Group + 环回鉴权控制" : "环回鉴权直传（兼容重签）", true)
                     row("隧道模式", engine.settings.globalMode ? "全局代理 + 全局黑洞" : "仅隔离 Claude 域名（国内直连）", true)
                     row("DNS 防泄露", "TUN 172.19.0.1 + FakeIP 198.18.0.0/15 + DoH", true)
                     row("当前出口", [engine.snapshot.exitCountry, engine.snapshot.exitIp, engine.snapshot.exitCity].compactMap { $0 }.joined(separator: " · ").nonEmpty ?? "未校验", engine.snapshot.exitIp != nil)

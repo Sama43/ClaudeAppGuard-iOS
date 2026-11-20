@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct ClaudeAppGuardApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var engine = VpnManagerEngine()
     @State private var selectedTab = 0
 
@@ -24,6 +25,7 @@ struct ClaudeAppGuardApp: App {
                     .tabItem { Label("审计", systemImage: "lock.doc.fill") }
                     .tag(3)
             }
+            .onChange(of: scenePhase, initial: true) { _, phase in engine.setForeground(phase == .active) }
             .tint(VpnTheme.accentTeal)
             .preferredColorScheme(.dark)
         }
