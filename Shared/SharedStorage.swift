@@ -45,6 +45,14 @@ final class SharedStorage {
         removeLegacyCatalog()
     }
 
+    /// Recovers from an unreadable catalog (e.g. after re-signing with a new Team ID that wiped Keychain).
+    func resetCatalog() throws {
+        defaults.removeObject(forKey: Keys.catalog)
+        removeLegacyCatalog()
+        CatalogKey().delete()
+        try saveCatalog(CredentialCatalog(nodes: [], subscriptions: []))
+    }
+
     private func removeLegacyCatalog() {
         for name in [Keys.nodes, Keys.subscriptions] where defaults.object(forKey: name) != nil {
             defaults.removeObject(forKey: name)

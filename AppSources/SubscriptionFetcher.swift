@@ -9,10 +9,99 @@ struct SubscriptionFetchMeta {
     let fetchedViaProxy: Bool
 }
 
-private final class HTTPSRedirects: NSObject, URLSessionTaskDelegate {
+/// Streams chunked HTTP response bodies with strict HTTPS-only redirects and a hard byte cap,
+/// avoiding byte-by-byte AsyncBytes overhead on multi-megabyte Clash YAML subscriptions.
+private final class BoundedHTTPSFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let maximumBytes: Int
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var response: HTTPURLResponse?
+    private var overflowed = false
+    private var continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>?
+
+    init(maximumBytes: Int) {
+        self.maximumBytes = maximumBytes
+    }
+
+    func fetch(request: URLRequest, configuration: URLSessionConfiguration) async throws -> (Data, HTTPURLResponse) {
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        let task = session.dataTask(with: request)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                lock.lock()
+                continuation = cont
+                lock.unlock()
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+            session.invalidateAndCancel()
+        }
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(request.url?.scheme?.lowercased() == "https" ? request : nil)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            return
+        }
+        if response.expectedContentLength > Int64(maximumBytes) {
+            lock.lock()
+            overflowed = true
+            lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        lock.lock()
+        self.response = http
+        if response.expectedContentLength > 0 {
+            buffer.reserveCapacity(min(Int(response.expectedContentLength), maximumBytes))
+        }
+        lock.unlock()
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        if buffer.count + data.count > maximumBytes {
+            overflowed = true
+            lock.unlock()
+            dataTask.cancel()
+            return
+        }
+        buffer.append(data)
+        lock.unlock()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        defer { session.finishTasksAndInvalidate() }
+        lock.lock()
+        let cont = continuation
+        continuation = nil
+        let didOverflow = overflowed
+        let resp = response
+        let data = buffer
+        lock.unlock()
+
+        guard let cont else { return }
+        if didOverflow {
+            cont.resume(throwing: URLError(.dataLengthExceedsMaximum))
+            return
+        }
+        if let error {
+            cont.resume(throwing: error)
+            return
+        }
+        guard let resp else {
+            cont.resume(throwing: URLError(.badServerResponse))
+            return
+        }
+        cont.resume(returning: (data, resp))
     }
 }
 
@@ -37,15 +126,16 @@ enum SubscriptionFetcher {
             throw NSError(domain: "SubFetcher", code: 2, userInfo: [NSLocalizedDescriptionKey: "当前未连代理且未开启直连拉取订阅开关"])
         }
 
-        let session: URLSession
+        let cfg: URLSessionConfiguration
         if useProxy, let port = activeCorePort {
-            session = ExitIpVerifier.makeStrictlyProxiedSession(corePort: port, timeoutSec: 18)
+            cfg = ExitIpVerifier.makeStrictlyProxiedConfiguration(corePort: port, timeoutSec: 18)
         } else {
-            let cfg = URLSessionConfiguration.ephemeral
-            cfg.timeoutIntervalForRequest = 18
-            session = URLSession(configuration: cfg)
+            let ephemeral = URLSessionConfiguration.ephemeral
+            ephemeral.timeoutIntervalForRequest = 18
+            ephemeral.timeoutIntervalForResource = 25
+            ephemeral.requestCachePolicy = .reloadIgnoringLocalCacheData
+            cfg = ephemeral
         }
-        defer { session.invalidateAndCancel() }
 
         var lastError = "未知错误"
         for ua in userAgents {
@@ -55,17 +145,11 @@ enum SubscriptionFetcher {
                 req.setValue(ua, forHTTPHeaderField: "User-Agent")
                 req.setValue("*/*", forHTTPHeaderField: "Accept")
 
-                let (bytes, resp) = try await session.bytes(for: req, delegate: HTTPSRedirects())
+                let fetcher = BoundedHTTPSFetchDelegate(maximumBytes: maximumBytes)
+                let (data, http) = try await fetcher.fetch(request: req, configuration: cfg)
                 try Task.checkCancellation()
-                guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-                    let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                    throw NSError(domain: "SubFetcher", code: code, userInfo: [NSLocalizedDescriptionKey: "HTTP \(code)"])
-                }
-                guard resp.expectedContentLength <= Int64(maximumBytes) else { throw URLError(.dataLengthExceedsMaximum) }
-                var data = Data()
-                for try await byte in bytes {
-                    guard data.count < maximumBytes else { throw URLError(.dataLengthExceedsMaximum) }
-                    data.append(byte)
+                guard (200...299).contains(http.statusCode) else {
+                    throw NSError(domain: "SubFetcher", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"])
                 }
                 guard let body = String(data: data, encoding: .utf8), !body.isEmpty else {
                     throw NSError(domain: "SubFetcher", code: 3, userInfo: [NSLocalizedDescriptionKey: "订阅返回空内容"])

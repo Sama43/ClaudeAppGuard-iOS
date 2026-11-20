@@ -11,15 +11,13 @@ struct CatalogKey {
     private let query: [String: Any]
 
     init() {
-        var attributes: [String: Any] = [
+        // Use the app's default Keychain access group (never pass an App Group ID as kSecAttrAccessGroup,
+        // which causes OSStatus -34018 errSecMissingEntitlement when keychain-access-groups is not declared).
+        query = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "ClaudeAppGuard.catalog",
             kSecAttrAccount as String: "encryption-key-v1"
         ]
-        if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: SharedConstants.appGroupId) != nil {
-            attributes[kSecAttrAccessGroup as String] = SharedConstants.appGroupId
-        }
-        query = attributes
     }
 
     func load(create: Bool) throws -> SymmetricKey {
@@ -41,5 +39,9 @@ struct CatalogKey {
         if added == errSecDuplicateItem { return try load(create: false) }
         guard added == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(added)) }
         return key
+    }
+
+    func delete() {
+        SecItemDelete(query as CFDictionary)
     }
 }

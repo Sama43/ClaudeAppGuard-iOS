@@ -4,7 +4,7 @@ import Network
 /// Strictly proxied Exit IP & Country Verifier using iOS 17+ URLSessionConfiguration.proxyConfigurations.
 enum ExitIpVerifier {
 
-    static func makeStrictlyProxiedSession(corePort: Int, timeoutSec: TimeInterval) -> URLSession {
+    static func makeStrictlyProxiedConfiguration(corePort: Int, timeoutSec: TimeInterval) -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = timeoutSec
         config.timeoutIntervalForResource = timeoutSec
@@ -16,7 +16,11 @@ enum ExitIpVerifier {
             let proxy = ProxyConfiguration(httpCONNECTProxy: endpoint)
             config.proxyConfigurations = [proxy]
         }
-        return URLSession(configuration: config)
+        return config
+    }
+
+    static func makeStrictlyProxiedSession(corePort: Int, timeoutSec: TimeInterval) -> URLSession {
+        URLSession(configuration: makeStrictlyProxiedConfiguration(corePort: corePort, timeoutSec: timeoutSec))
     }
 
     static func verify(corePort: Int, enrichGeo: Bool = true, timeoutSec: TimeInterval = 8) async -> ExitCheckResult {

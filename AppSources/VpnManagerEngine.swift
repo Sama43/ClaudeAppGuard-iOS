@@ -49,9 +49,11 @@ final class VpnManagerEngine: ObservableObject {
     private var startupWatchTask: Task<Void, Never>?
     private var userRequestedStop = false
     private var pendingAutoRetrySessionId: UUID? = nil
+    private var lastAppliedSnapshotRevision: UInt64 = 0
     private var lastAppliedSnapshotDate: Date = .distantPast
     private var currentControlToken: String = ""
     private var commandSequence: UInt64 = 0
+    private var startAttemptId: UInt64 = 0
     private var snapshotETag: String?
     private var runningNodeTests = 0
     private var refreshingSubscriptionIds = Set<UUID>()
@@ -96,6 +98,18 @@ final class VpnManagerEngine: ObservableObject {
         try storage.saveCatalog(CredentialCatalog(nodes: nextNodes, subscriptions: nextSubscriptions))
         nodes = nextNodes
         subscriptions = nextSubscriptions
+    }
+
+    func resetCatalogAfterError() {
+        do {
+            try storage.resetCatalog()
+            nodes = []
+            subscriptions = []
+            catalogError = nil
+            recordLocalEvent(.warn, tag: "STORAGE", "已重建凭据库，请重新导入机场订阅或节点")
+        } catch {
+            catalogError = "重建凭据库失败：\(error.localizedDescription)"
+        }
     }
 
     private func requestNotificationAuth() {
@@ -248,7 +262,13 @@ final class VpnManagerEngine: ObservableObject {
 
     @discardableResult
     private func applyIncomingSnapshot(_ snap: TunnelSnapshot) -> Bool {
-        guard vpnStatus == .connected, snap.updatedAt > lastAppliedSnapshotDate else { return false }
+        guard vpnStatus == .connected else { return false }
+        if snap.revision > 0 {
+            guard snap.revision > lastAppliedSnapshotRevision else { return false }
+            lastAppliedSnapshotRevision = snap.revision
+        } else {
+            guard snap.updatedAt > lastAppliedSnapshotDate else { return false }
+        }
         lastAppliedSnapshotDate = snap.updatedAt
         snapshot = snap
         return true
@@ -276,6 +296,7 @@ final class VpnManagerEngine: ObservableObject {
         if vpnStatus == .connected {
             let livePayload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: currentControlToken)
             if let liveData = try? JSONEncoder().encode(livePayload) {
+                persistLiveConfiguration(payloadData: liveData, server: node.server)
                 sendTunnelCommand("activate_payload:" + liveData.base64EncodedString())
                 recordLocalEvent(.info, tag: "IDENTITY", "正在切换官方客户端身份 -> 「\(session.name)」")
             }
@@ -289,6 +310,7 @@ final class VpnManagerEngine: ObservableObject {
         }
         let freshToken = Data(random).base64EncodedString()
         snapshotETag = nil
+        lastAppliedSnapshotRevision = 0
         currentControlToken = freshToken
         let payload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: freshToken)
         guard let payloadData = try? JSONEncoder().encode(payload) else {
@@ -301,6 +323,9 @@ final class VpnManagerEngine: ObservableObject {
             loadOrCreateManager()
             return
         }
+
+        startAttemptId &+= 1
+        let attempt = startAttemptId
 
         lastAppliedSnapshotDate = .distantPast
         snapshot.status = .startingCore
@@ -321,7 +346,7 @@ final class VpnManagerEngine: ObservableObject {
 
         mgr.saveToPreferences { [weak self] err in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.startAttemptId == attempt, !self.userRequestedStop else { return }
                 if let err {
                     self.snapshot.status = .stopped
                     self.lastDisconnectError = err.localizedDescription
@@ -330,7 +355,7 @@ final class VpnManagerEngine: ObservableObject {
                 }
                 mgr.loadFromPreferences { [weak self] loadErr in
                     Task { @MainActor [weak self] in
-                        guard let self else { return }
+                        guard let self, self.startAttemptId == attempt, !self.userRequestedStop else { return }
                         if let loadErr {
                             self.snapshot.status = .stopped
                             self.lastDisconnectError = loadErr.localizedDescription
@@ -339,6 +364,7 @@ final class VpnManagerEngine: ObservableObject {
                         }
                         // Brief settle delay after save/load avoids iOS neagent first-launch code=12 race
                         try? await Task.sleep(nanoseconds: 250_000_000)
+                        guard self.startAttemptId == attempt, !self.userRequestedStop else { return }
                         do {
                             try (mgr.connection as? NETunnelProviderSession)?.startTunnel(
                                 options: ["payload": payloadData as NSData]
@@ -354,6 +380,17 @@ final class VpnManagerEngine: ObservableObject {
                 }
             }
         }
+    }
+
+    private func persistLiveConfiguration(payloadData: Data, server: String) {
+        guard let mgr = manager else { return }
+        let proto = (mgr.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = resolvedExtensionId
+        proto.serverAddress = server
+        proto.providerConfiguration = ["payload": payloadData]
+        mgr.protocolConfiguration = proto
+        mgr.isEnabled = true
+        mgr.saveToPreferences { _ in }
     }
 
     private func armStartupWatchdog(mgr: NETunnelProviderManager) {
@@ -395,6 +432,7 @@ final class VpnManagerEngine: ObservableObject {
 
     func stopVpnCompletely() {
         userRequestedStop = true
+        startAttemptId &+= 1
         pendingAutoRetrySessionId = nil
         startupWatchTask?.cancel()
         manager?.connection.stopVPNTunnel()
@@ -415,6 +453,7 @@ final class VpnManagerEngine: ObservableObject {
               let data = try? JSONEncoder().encode(TunnelLaunchPayload(node: node, session: sess, settings: settings, controlToken: currentControlToken)) else {
             return
         }
+        persistLiveConfiguration(payloadData: data, server: node.server)
         sendReloadPayload(data)
     }
 
@@ -436,10 +475,17 @@ final class VpnManagerEngine: ObservableObject {
             req.httpBody = Data(body.utf8)
             req.setValue(envelope.authorization, forHTTPHeaderField: "X-CG-Token")
             if let (data, resp) = try? await loopbackSession.data(for: req),
-               (resp as? HTTPURLResponse)?.statusCode == 200,
-               let plain = try? envelope.open(data, for: "snapshot"),
-               let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: plain) {
-                if currentControlToken == token { applyIncomingSnapshot(snap) }
+               (resp as? HTTPURLResponse)?.statusCode == 200 {
+                if let plain = try? envelope.open(data, for: "snapshot"),
+                   let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: plain),
+                   currentControlToken == token {
+                    applyIncomingSnapshot(snap)
+                }
+                // Follow up quickly after PacketTunnel's serial queue finishes applying the command.
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if currentControlToken == token && vpnStatus == .connected {
+                    await pollLoopbackMirror()
+                }
                 return
             }
             if currentControlToken == token && vpnStatus == .connected { sendViaXpcFallback(message) }

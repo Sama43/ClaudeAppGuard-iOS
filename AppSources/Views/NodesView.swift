@@ -49,8 +49,10 @@ struct NodesView: View {
                     Button {
                         let text = (UIPasteboard.general.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                         if text.isEmpty { banner = (false, "剪贴板为空") }
-                        else if (text.hasPrefix("http://") || text.hasPrefix("https://")) && !text.contains("\n") {
+                        else if text.lowercased().hasPrefix("https://") && !text.contains("\n") {
                             importTab = 0; prefillUrl = text; showImport = true
+                        } else if text.lowercased().hasPrefix("http://") && !text.contains("\n") {
+                            banner = (false, "仅支持 HTTPS 机场订阅链接，请将链接改为 https://")
                         } else {
                             let res = engine.importNodesFromText(text)
                             banner = res.nodes.isEmpty ? (false, res.errors.first ?? "无法识别") : (true, "成功导入 \(res.nodes.count) 个节点")
@@ -63,7 +65,18 @@ struct NodesView: View {
                 }
                 .padding(.horizontal)
 
-                if let error = engine.catalogError { Text(error).foregroundStyle(VpnTheme.killRed).font(.caption) }
+                if let error = engine.catalogError {
+                    HStack(spacing: 8) {
+                        Text(error).foregroundStyle(VpnTheme.killRed).font(.caption)
+                        Spacer()
+                        Button("重建凭据库") { engine.resetCatalogAfterError() }
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(VpnTheme.killRedBg).foregroundStyle(VpnTheme.killRed)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    .padding(.horizontal)
+                }
                 if let b = banner {
                     Text(b.1).font(.caption).foregroundStyle(b.0 ? VpnTheme.shieldGreen : VpnTheme.killRed)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(8)

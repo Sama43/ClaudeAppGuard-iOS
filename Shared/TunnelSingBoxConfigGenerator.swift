@@ -107,7 +107,7 @@ enum TunnelSingBoxConfigGenerator {
                 "server": "1.1.1.1",
                 "server_port": 443,
                 "path": "/dns-query",
-                "detour": proxyTag
+                "detour": "guard"
             ],
             [
                 "tag": "dns_local",
@@ -161,7 +161,7 @@ enum TunnelSingBoxConfigGenerator {
 
         let root: [String: Any] = [
             "experimental": ["cache_file": ["enabled": true, "path": cacheURL.path, "store_fakeip": true]],
-            "log": ["level": "warn", "timestamp": false],
+            "log": ["level": "info", "timestamp": false],
             "dns": [
                 "servers": dnsServers,
                 "rules": dnsRules,

@@ -148,6 +148,7 @@ struct ParseBatchResult {
 
 /// Real-time status snapshot published by PacketTunnelProvider into App Group storage.
 struct TunnelSnapshot: Codable {
+    var revision: UInt64 = 0
     var status: TunnelGuardStatus = .stopped
     var activeSessionId: UUID? = nil
     var activeSessionName: String? = nil

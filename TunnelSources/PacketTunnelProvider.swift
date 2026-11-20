@@ -27,8 +27,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var manuallyLocked = false
     private var offline = false
     private var lastInterface: NWInterface.InterfaceType?
-    private var transientFailures = 0
     private var retryIndex = 0
+    private var snapshotRevision: UInt64 = 0
     private var envelope: LoopbackEnvelope?
     private var lastCommand: UInt64 = 0
     private var lastLockDecision: UInt64 = 0
@@ -59,7 +59,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.offline = false
             self.lastInterface = nil
             self.retryIndex = 0
-            self.transientFailures = 0
+            self.snapshotRevision = 0
             guard let node = self.currentNode else {
                 completionHandler(self.failure("未找到已绑定节点，请返回 App 重新选择"))
                 return
@@ -155,7 +155,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func handleCommand(_ message: String) {
-        if message == "status" { return }
+        if message == "status" {
+            publish(persist: false)
+            return
+        }
         let parts = message.split(separator: ":", maxSplits: 1)
         guard utunFd >= 0, parts.count == 2, let sequence = UInt64(parts[0]) else { return }
         let cmd = String(parts[1])
@@ -258,7 +261,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             catch { lockTraffic(error.localizedDescription, manual: true); return }
         }
         retryIndex = 0
-        transientFailures = 0
         snapshot.status = .verifyingExit
         snapshot.killSwitchReason = nil
         recordEvent(.info, tag: "VERIFY", "正在通过已绑定节点校验出口")
@@ -283,14 +285,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func applyCheck(_ result: ExitCheckResult) {
         let wasProtected = snapshot.status == .protected
         guard result.success, let ip = result.exitIp, let country = result.countryCode else {
-            transientFailures += 1
-            if wasProtected && transientFailures == 1 {
-                recordEvent(.warn, tag: "VERIFY", "出口巡检未响应，正在复查")
-                scheduleCheck(after: 0)
-                return
-            }
-            lockTraffic("出口暂时不可验证，将自动重试", manual: false)
-            let delays = [3, 6, 12, 30]
+            // Fail-closed immediately on the very first missed probe (zero grace window!).
+            // Because guard selector flips instantaneously without tearing down utun, auto-retry recovers quickly.
+            let errDetail = result.error.map { "：\($0)" } ?? ""
+            lockTraffic("出口校验超时/断线\(errDetail)，已瞬时黑洞封锁并自动重试", manual: false)
+            let delays = [2, 5, 10, 20]
             scheduleCheck(after: delays[retryIndex])
             retryIndex = min(retryIndex + 1, delays.count - 1)
             return
@@ -327,7 +326,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
-        transientFailures = 0
         retryIndex = 0
         scheduleCheck(after: max(3, min(120, settings.watchdogIntervalSec)))
     }
@@ -340,8 +338,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let interface = path.availableInterfaces.first { $0.type != .other && path.usesInterfaceType($0.type) }?.type
             let wasOffline = self.offline
             self.offline = path.status != .satisfied
-            let switched = self.lastInterface != nil && interface != self.lastInterface
-            if !self.offline { self.lastInterface = interface }
+            var switched = false
+            if !self.offline, let interface {
+                switched = self.lastInterface != nil && interface != self.lastInterface
+                self.lastInterface = interface
+            }
             guard !self.manuallyLocked else { return }
             if self.offline {
                 if !wasOffline { self.lockTraffic("网络已断开，等待恢复后校验", manual: false) }
@@ -360,6 +361,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func publish(persist: Bool = true) {
+        snapshotRevision &+= 1
+        snapshot.revision = snapshotRevision
         snapshot.updatedAt = Date()
         if persist { storage.saveSnapshot(snapshot) }
         var live = snapshot

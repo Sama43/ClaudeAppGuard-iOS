@@ -20,6 +20,10 @@ struct TunnelConfigTests {
             precondition(selector["default"] as? String == "sealed")
             precondition(selector["outbounds"] as? [String] == ["sealed", tag])
             precondition(selector["interrupt_exist_connections"] as? Bool == true)
+            let dns = root["dns"] as! [String: Any]
+            let dnsServers = dns["servers"] as! [[String: Any]]
+            let dnsRemote = dnsServers.first { $0["tag"] as? String == "dns_remote" }!
+            precondition(dnsRemote["detour"] as? String == "guard")
             let route = root["route"] as! [String: Any]
             precondition(route["final"] as? String == (global ? "guard" : "direct"))
             let rules = route["rules"] as! [[String: Any]]
