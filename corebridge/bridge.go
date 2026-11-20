@@ -117,7 +117,7 @@ func StartStatusServer(port int32, controlToken string, handler CommandHandler) 
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		if body == "" {
 			w.WriteHeader(http.StatusNoContent)
@@ -135,7 +135,7 @@ func StartStatusServer(port int32, controlToken string, handler CommandHandler) 
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		raw, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -147,7 +147,7 @@ func StartStatusServer(port int32, controlToken string, handler CommandHandler) 
 		statusMu.RLock()
 		body := statusJSON
 		statusMu.RUnlock()
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		if body != "" {
 			_, _ = w.Write([]byte(body))

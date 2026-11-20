@@ -63,6 +63,7 @@ struct NodesView: View {
                 }
                 .padding(.horizontal)
 
+                if let error = engine.catalogError { Text(error).foregroundStyle(VpnTheme.killRed).font(.caption) }
                 if let b = banner {
                     Text(b.1).font(.caption).foregroundStyle(b.0 ? VpnTheme.shieldGreen : VpnTheme.killRed)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(8)

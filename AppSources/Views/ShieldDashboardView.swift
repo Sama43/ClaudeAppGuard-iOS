@@ -224,7 +224,7 @@ struct ShieldDashboardView: View {
     private var architectureNoteCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("iOS 黑洞防直连机制说明").font(.caption.bold()).foregroundStyle(VpnTheme.accentTeal)
-            Text("1. 由 PacketTunnel 扩展在后台运行内置 sing-box 1.14.4（FakeIP 零国内 DNS 泄露 + 自动拒绝 UDP 443 QUIC）。\n2. 后台每 5 秒持续巡检出口 IP 与地区；一旦代理断线、切换 Wi-Fi/5G、出现香港/大陆出口或 IP 漂移，扩展会瞬间将 Claude 域名切换为 reject 黑洞丢弃并推送告警，绝不直连！\n3. 签名要求：因包含 NetworkExtension，需使用巨魔（TrollStore）或具备 VPN/AppGroup 权限的证书安装。")
+            Text("隧道启动时先封锁目标流量，出口通过校验后才放行。断网恢复后会重新校验；巡检连续两次超时会封锁并自动重试。手动熔断、地区或锁定 IP 不符时，需要手动重新校验。")
                 .font(.caption2)
                 .foregroundStyle(VpnTheme.textSecondary)
                 .lineSpacing(3)

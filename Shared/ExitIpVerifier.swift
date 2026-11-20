@@ -24,6 +24,25 @@ enum ExitIpVerifier {
             return ExitCheckResult(success: false, error: "代理内核端口无效")
         }
 
+        let verified = await withTaskGroup(of: ExitCheckResult.self) { group in
+            group.addTask { await checkExit(corePort: corePort, timeoutSec: timeoutSec) }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSec * 1_000_000_000))
+                return ExitCheckResult(success: false, error: "出口校验超时")
+            }
+            let first = await group.next() ?? ExitCheckResult(success: false, error: "出口校验已取消")
+            group.cancelAll()
+            return first
+        }
+        guard verified.success, enrichGeo, !Task.isCancelled, let ip = verified.exitIp else { return verified }
+        let details = await geo(corePort: corePort, expectedIP: ip)
+        var enriched = verified
+        enriched.city = details?.city
+        enriched.org = details?.org
+        return enriched
+    }
+
+    private static func checkExit(corePort: Int, timeoutSec: TimeInterval) async -> ExitCheckResult {
         let session = makeStrictlyProxiedSession(corePort: corePort, timeoutSec: timeoutSec)
         defer { session.invalidateAndCancel() }
 
@@ -84,14 +103,10 @@ enum ExitIpVerifier {
             return ExitCheckResult(success: false, error: "代理出口探测失败: \(primaryErr ?? "无响应")")
         }
 
-        let details = enrichGeo ? await geo(corePort: corePort, expectedIP: ip) : nil
-
         return ExitCheckResult(
             success: true,
             exitIp: ip,
             countryCode: cc,
-            org: details?.org,
-            city: details?.city,
             latencyMs: latencyMs
         )
     }

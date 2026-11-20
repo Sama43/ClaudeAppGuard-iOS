@@ -15,6 +15,7 @@ final class VpnManagerEngine: ObservableObject {
     @Published var settings: VpnGuardSettings = VpnGuardSettings()
     @Published var activeSessionId: UUID? = nil
     @Published var localEvents: [SecurityEvent] = []
+    @Published private(set) var catalogError: String?
     @Published var lastDisconnectError: String? = nil
 
     let resolvedExtensionId: String = SharedConstants.resolvedTunnelBundleId()
@@ -50,6 +51,7 @@ final class VpnManagerEngine: ObservableObject {
     private var pendingAutoRetrySessionId: UUID? = nil
     private var lastAppliedSnapshotDate: Date = .distantPast
     private var currentControlToken: String = ""
+    private var commandSequence: UInt64 = 0
     private var snapshotETag: String?
     private var runningNodeTests = 0
     private var refreshingSubscriptionIds = Set<UUID>()
@@ -63,15 +65,37 @@ final class VpnManagerEngine: ObservableObject {
     }()
 
     init() {
-        self.nodes = storage.loadNodes()
-        self.subscriptions = storage.loadSubscriptions()
+        loadCatalog()
         self.sessions = storage.loadSessions()
         self.settings = storage.loadSettings()
         self.activeSessionId = storage.loadActiveSessionId()
         self.snapshot = storage.loadSnapshot()
+        self.snapshot.status = .stopped
 
         requestNotificationAuth()
         loadOrCreateManager()
+    }
+
+    private func loadCatalog() {
+        do {
+            let catalog = try storage.loadCatalog(migrate: true)
+            nodes = catalog.nodes
+            subscriptions = catalog.subscriptions
+            catalogError = nil
+        } catch {
+            if let legacy = try? storage.loadCatalog() {
+                nodes = legacy.nodes
+                subscriptions = legacy.subscriptions
+            }
+            catalogError = "无法读取或迁移节点凭据，请解锁设备并检查签名权限：\(error.localizedDescription)"
+        }
+    }
+
+    private func commitCatalog(nodes nextNodes: [ProxyNode], subscriptions nextSubscriptions: [SubscriptionProfile]) throws {
+        if let catalogError { throw NSError(domain: "Catalog", code: 1, userInfo: [NSLocalizedDescriptionKey: catalogError]) }
+        try storage.saveCatalog(CredentialCatalog(nodes: nextNodes, subscriptions: nextSubscriptions))
+        nodes = nextNodes
+        subscriptions = nextSubscriptions
     }
 
     private func requestNotificationAuth() {
@@ -87,7 +111,7 @@ final class VpnManagerEngine: ObservableObject {
                 }
                 if let existing = managers?.first(where: {
                     ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == self.resolvedExtensionId
-                }) ?? managers?.first {
+                }) {
                     self.manager = existing
                     self.vpnStatus = existing.connection.status
                     if let proto = existing.protocolConfiguration as? NETunnelProviderProtocol,
@@ -189,6 +213,7 @@ final class VpnManagerEngine: ObservableObject {
     func setForeground(_ active: Bool) {
         pollTask?.cancel()
         guard active else { return }
+        if catalogError != nil { loadCatalog() }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -204,13 +229,15 @@ final class VpnManagerEngine: ObservableObject {
         guard let url = URL(string: "http://127.0.0.1:\(SharedConstants.statusMirrorPort)/snapshot") else { return }
         let token = currentControlToken
         if !token.isEmpty {
+            let envelope = LoopbackEnvelope(token: token)
             var request = URLRequest(url: url)
-            request.setValue(token, forHTTPHeaderField: "X-CG-Token")
+            request.setValue(envelope.authorization, forHTTPHeaderField: "X-CG-Token")
             request.setValue(snapshotETag, forHTTPHeaderField: "If-None-Match")
             if let (data, response) = try? await loopbackSession.data(for: request),
                let http = response as? HTTPURLResponse, token == currentControlToken, vpnStatus == .connected {
                 if http.statusCode == 304 { return }
-                if http.statusCode == 200, let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: data) {
+                if http.statusCode == 200, let plain = try? envelope.open(data, for: "snapshot"),
+                   let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: plain) {
                     if applyIncomingSnapshot(snap) { snapshotETag = http.value(forHTTPHeaderField: "ETag") }
                     return
                 }
@@ -249,7 +276,7 @@ final class VpnManagerEngine: ObservableObject {
         if vpnStatus == .connected {
             let livePayload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: currentControlToken)
             if let liveData = try? JSONEncoder().encode(livePayload) {
-                sendReloadPayload(liveData)
+                sendTunnelCommand("activate_payload:" + liveData.base64EncodedString())
                 recordLocalEvent(.info, tag: "IDENTITY", "正在切换官方客户端身份 -> 「\(session.name)」")
             }
             return
@@ -394,33 +421,29 @@ final class VpnManagerEngine: ObservableObject {
     private func sendTunnelCommand(_ cmd: String) {
         guard vpnStatus == .connected else { return }
 
-        // Primary: Authenticated loopback control channel (127.0.0.1:49271/cmd with per-session 256-bit X-CG-Token)
-        // Works 100% even when IPA re-signing makes Apple XPC sendProviderMessage return nil!
-        if !currentControlToken.isEmpty,
-           let url = URL(string: "http://127.0.0.1:\(SharedConstants.statusMirrorPort)/cmd"),
-           let body = cmd.data(using: .utf8) {
-            let token = currentControlToken
-            Task { [weak self] in
-                guard let self else { return }
-                var req = URLRequest(url: url)
-                req.httpMethod = "POST"
-                req.httpBody = body
-                req.setValue(token, forHTTPHeaderField: "X-CG-Token")
-                req.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
-                if let (data, resp) = try? await self.loopbackSession.data(for: req),
-                   let http = resp as? HTTPURLResponse, http.statusCode == 200 {
-                    if let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: data) {
-                        await MainActor.run { self.applyIncomingSnapshot(snap) }
-                    }
-                    return
-                }
-                // Silent fallback to Apple XPC if loopback control didn't respond
-                await MainActor.run { self.sendViaXpcFallback(cmd) }
-            }
+        commandSequence = max(commandSequence + 1, DispatchTime.now().uptimeNanoseconds)
+        let message = "\(commandSequence):\(cmd)"
+        let token = currentControlToken
+        let envelope = LoopbackEnvelope(token: token)
+        guard !token.isEmpty, let url = URL(string: "http://127.0.0.1:\(SharedConstants.statusMirrorPort)/cmd"),
+              let body = try? envelope.seal(Data(message.utf8), for: "command") else {
+            sendViaXpcFallback(message)
             return
         }
-
-        sendViaXpcFallback(cmd)
+        Task {
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.httpBody = Data(body.utf8)
+            req.setValue(envelope.authorization, forHTTPHeaderField: "X-CG-Token")
+            if let (data, resp) = try? await loopbackSession.data(for: req),
+               (resp as? HTTPURLResponse)?.statusCode == 200,
+               let plain = try? envelope.open(data, for: "snapshot"),
+               let snap = try? JSONDecoder().decode(TunnelSnapshot.self, from: plain) {
+                if currentControlToken == token { applyIncomingSnapshot(snap) }
+                return
+            }
+            if currentControlToken == token && vpnStatus == .connected { sendViaXpcFallback(message) }
+        }
     }
 
     private func sendViaXpcFallback(_ cmd: String) {
@@ -496,8 +519,8 @@ final class VpnManagerEngine: ObservableObject {
     func importNodesFromText(_ rawText: String) -> ParseBatchResult {
         let res = NodeUriParser.parseInput(rawText)
         if !res.nodes.isEmpty {
-            nodes.append(contentsOf: res.nodes)
-            storage.saveNodes(nodes)
+            do { try commitCatalog(nodes: nodes + res.nodes, subscriptions: subscriptions) }
+            catch { return ParseBatchResult(nodes: [], errors: [error.localizedDescription]) }
             recordLocalEvent(.success, tag: "NODES", "成功导入 \(res.nodes.count) 个节点")
         }
         return res
@@ -550,12 +573,10 @@ final class VpnManagerEngine: ObservableObject {
         updated.totalBytes = meta.totalBytes ?? updated.totalBytes
         updated.expireTimestampSec = meta.expireTimestampSec ?? updated.expireTimestampSec
 
-        nodes = nodes.filter { $0.subscriptionId != profile.id } + tagged
-        storage.saveNodes(nodes)
-
-        if isNew { subscriptions.append(updated) }
-        else if let subscriptionIndex { subscriptions[subscriptionIndex] = updated }
-        storage.saveSubscriptions(subscriptions)
+        var nextSubscriptions = subscriptions
+        if let subscriptionIndex { nextSubscriptions[subscriptionIndex] = updated }
+        else { nextSubscriptions.append(updated) }
+        try commitCatalog(nodes: nodes.filter { $0.subscriptionId != profile.id } + tagged, subscriptions: nextSubscriptions)
 
         recordLocalEvent(.success, tag: "SUB", "订阅「\(updated.name)」已更新 \(tagged.count) 个节点")
         if affectedSessions.contains(where: { $0.id == activeSessionId }) { tripBlackholeKillSwitch() }
@@ -567,16 +588,16 @@ final class VpnManagerEngine: ObservableObject {
 
     func deleteSubscription(_ subId: UUID) {
         if let activeSession, nodes.contains(where: { $0.subscriptionId == subId && $0.id == activeSession.boundNodeId }) { tripBlackholeKillSwitch() }
-        nodes.removeAll { $0.subscriptionId == subId }
-        storage.saveNodes(nodes)
-        subscriptions.removeAll { $0.id == subId }
-        storage.saveSubscriptions(subscriptions)
+        do {
+            try commitCatalog(nodes: nodes.filter { $0.subscriptionId != subId }, subscriptions: subscriptions.filter { $0.id != subId })
+        } catch { recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription) }
     }
 
     func deleteNode(_ nodeId: UUID) {
         if activeSession?.boundNodeId == nodeId { tripBlackholeKillSwitch() }
-        nodes.removeAll { $0.id == nodeId }
-        storage.saveNodes(nodes)
+        do {
+            try commitCatalog(nodes: nodes.filter { $0.id != nodeId }, subscriptions: subscriptions)
+        } catch { recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription) }
     }
 
     func testNodeIsolated(_ node: ProxyNode) async -> ExitCheckResult {
@@ -599,11 +620,13 @@ final class VpnManagerEngine: ObservableObject {
         let check = await ExitIpVerifier.verify(corePort: port, enrichGeo: true, timeoutSec: 8)
         await Task.detached { CorebridgeStopTempCore(handle) }.value
         if check.success, let idx = nodes.firstIndex(where: { $0.id == node.id }) {
-            nodes[idx].lastLatencyMs = check.latencyMs
-            nodes[idx].lastExitIp = check.exitIp
-            nodes[idx].lastExitCountry = check.countryCode
-            nodes[idx].lastExitOrg = check.org ?? nodes[idx].lastExitOrg
-            storage.saveNodes(nodes)
+            var measured = nodes
+            measured[idx].lastLatencyMs = check.latencyMs
+            measured[idx].lastExitIp = check.exitIp
+            measured[idx].lastExitCountry = check.countryCode
+            measured[idx].lastExitOrg = check.org ?? measured[idx].lastExitOrg
+            do { try commitCatalog(nodes: measured, subscriptions: subscriptions) }
+            catch { recordLocalEvent(.warn, tag: "STORAGE", error.localizedDescription) }
         }
         return check
     }

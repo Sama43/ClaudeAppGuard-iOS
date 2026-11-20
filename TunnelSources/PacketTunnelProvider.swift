@@ -12,7 +12,7 @@ private final class TunnelCmdBridge: NSObject, CorebridgeCommandHandlerProtocol 
     }
     func onControlCommand(_ commandText: String?) {
         guard let commandText, !commandText.isEmpty else { return }
-        owner?.processControlCommand(commandText)
+        owner?.receiveLoopbackCommand(commandText)
     }
 }
 
@@ -29,6 +29,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastInterface: NWInterface.InterfaceType?
     private var transientFailures = 0
     private var retryIndex = 0
+    private var envelope: LoopbackEnvelope?
+    private var lastCommand: UInt64 = 0
+    private var lastLockDecision: UInt64 = 0
     private var cmdBridge: TunnelCmdBridge?
     private var utunFd: Int32 = -1
     private var probePort = 0
@@ -48,7 +51,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let savedId = self.storage.loadActiveSessionId()
             self.currentSession = payload?.session ?? self.storage.loadSessions().first { $0.id == savedId }
             let nodeId = self.currentSession?.boundNodeId
-            self.currentNode = payload?.node ?? self.storage.loadNodes().first { $0.id == nodeId }
+            self.currentNode = payload?.node ?? (try? self.storage.loadCatalog())?.nodes.first { $0.id == nodeId }
+            self.envelope = nil
+            self.lastCommand = 0
+            self.lastLockDecision = 0
             self.manuallyLocked = false
             self.offline = false
             self.lastInterface = nil
@@ -85,7 +91,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     let bridge = TunnelCmdBridge(owner: self)
                     self.cmdBridge = bridge
                     if let token = payload?.controlToken, !token.isEmpty {
-                        let error = CorebridgeStartStatusServer(SharedConstants.statusMirrorPort, token, bridge)
+                        let envelope = LoopbackEnvelope(token: token)
+                        self.envelope = envelope
+                        let error = CorebridgeStartStatusServer(SharedConstants.statusMirrorPort, envelope.authorization, bridge)
                         if !error.isEmpty { self.recordEvent(.warn, tag: "IPC", "本地状态服务不可用，使用系统 IPC") }
                     }
                     self.startPathMonitor()
@@ -130,8 +138,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    func processControlCommand(_ cmd: String) {
-        queue.async { self.handleCommand(cmd) }
+    func receiveLoopbackCommand(_ message: String) {
+        queue.async {
+            guard let envelope = self.envelope,
+                  let plain = try? envelope.open(Data(message.utf8), for: "command") else { return }
+            self.handleCommand(String(decoding: plain, as: UTF8.self))
+        }
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
@@ -142,27 +154,44 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func handleCommand(_ cmd: String) {
-        guard utunFd >= 0 else { return }
+    private func handleCommand(_ message: String) {
+        if message == "status" { return }
+        let parts = message.split(separator: ":", maxSplits: 1)
+        guard utunFd >= 0, parts.count == 2, let sequence = UInt64(parts[0]) else { return }
+        let cmd = String(parts[1])
+        // A later passive settings refresh cannot supersede a user's manual seal.
+        if cmd == "kill_switch" {
+            guard sequence > lastLockDecision else { return }
+            lastLockDecision = sequence
+        } else {
+            guard sequence > lastCommand else { return }
+        }
+        lastCommand = max(sequence, lastCommand)
         switch cmd {
-        case "status": return
         case "kill_switch":
             lockTraffic("已手动熔断，请手动重新校验", manual: true)
         case "reverify":
+            lastLockDecision = sequence
             manuallyLocked = false
             guard seal() else { return }
             beginVerification()
         case "reload":
             guard let session = storage.loadSessions().first(where: { $0.id == storage.loadActiveSessionId() }),
-                  let node = storage.loadNodes().first(where: { $0.id == session.boundNodeId }) else {
+                  let node = (try? storage.loadCatalog())?.nodes.first(where: { $0.id == session.boundNodeId }) else {
                 lockTraffic("已绑定节点不存在，请重新绑定", manual: true)
                 return
             }
             reload(node: node, session: session, settings: storage.loadSettings())
         default:
-            guard cmd.hasPrefix("reload_payload:"),
-                  let data = Data(base64Encoded: String(cmd.dropFirst("reload_payload:".count))),
+            let activate = cmd.hasPrefix("activate_payload:")
+            let prefix = activate ? "activate_payload:" : "reload_payload:"
+            guard cmd.hasPrefix(prefix),
+                  let data = Data(base64Encoded: String(cmd.dropFirst(prefix.count))),
                   let payload = try? JSONDecoder().decode(TunnelLaunchPayload.self, from: data) else { return }
+            if activate {
+                lastLockDecision = sequence
+                manuallyLocked = false
+            }
             reload(node: payload.node, session: payload.session, settings: payload.settings)
         }
     }
@@ -338,7 +367,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         live.probePort = snapshot.status == .protected ? probePort : nil
         live.coreLogs = raw.isEmpty ? [] : raw.components(separatedBy: .newlines)
         encodedSnapshot = try? JSONEncoder().encode(live)
-        if let data = encodedSnapshot { CorebridgeUpdateStatusJSON(String(decoding: data, as: UTF8.self)) }
+        if let data = encodedSnapshot, let envelope, let sealed = try? envelope.seal(data, for: "snapshot") {
+            CorebridgeUpdateStatusJSON(sealed)
+        }
     }
 
     private func resolveLaunchPayload(options: [String: NSObject]?) -> TunnelLaunchPayload? {
