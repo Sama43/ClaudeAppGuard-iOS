@@ -25,6 +25,7 @@ struct NodesView: View {
     @State private var banner: (Bool, String)? = nil
     @State private var testingIds: Set<UUID> = []
     @State private var refreshingSubs: Set<UUID> = []
+    @State private var inspectedNodeId: UUID? = nil
 
     private var filtered: [ProxyNode] {
         engine.nodes.filter { n in
@@ -173,6 +174,9 @@ struct NodesView: View {
                                                 .background(VpnTheme.cardDark).foregroundStyle(VpnTheme.textPrimary).clipShape(RoundedRectangle(cornerRadius: 8))
                                         }
                                     }.disabled(testing)
+                                    Button { inspectedNodeId = node.id } label: {
+                                        Image(systemName: "slider.horizontal.3").frame(width: 30, height: 30).foregroundStyle(VpnTheme.textSecondary)
+                                    }
                                     Button { engine.deleteNode(node.id) } label: {
                                         Image(systemName: "trash").frame(width: 30, height: 30).foregroundStyle(VpnTheme.textSecondary)
                                     }
@@ -198,6 +202,14 @@ struct NodesView: View {
                 VpnImportSheet(initialTab: importTab, prefillUrl: prefillUrl, engine: engine) { message in
                     banner = (true, message)
                     showImport = false
+                }
+            }
+            .sheet(isPresented: Binding(
+                get: { inspectedNodeId != nil },
+                set: { if !$0 { inspectedNodeId = nil } }
+            )) {
+                if let nid = inspectedNodeId, let node = engine.nodes.first(where: { $0.id == nid }) {
+                    NodeInspectorSheet(node: node, engine: engine)
                 }
             }
         }
@@ -281,6 +293,117 @@ private struct VpnImportSheet: View {
                 }
             }
             .onAppear { tab = initialTab; subUrl = prefillUrl }
+        }
+    }
+}
+
+private struct NodeInspectorSheet: View {
+    let node: ProxyNode
+    @ObservedObject var engine: VpnManagerEngine
+    @Environment(\.dismiss) private var dismiss
+    @State private var probeStatus: (Bool, String)? = nil
+    @State private var probing = false
+
+    private var parsedOutbound: [String: Any] {
+        guard let data = node.singBoxOutboundJson.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return [:] }
+        return obj
+    }
+
+    private var tlsDict: [String: Any]? { parsedOutbound["tls"] as? [String: Any] }
+    private var hasTls: Bool { tlsDict?["enabled"] as? Bool == true }
+    private var hasReality: Bool { (tlsDict?["reality"] as? [String: Any])?["enabled"] as? Bool == true }
+
+    private var redactedPrettyJson: String {
+        var copy = parsedOutbound
+        for secretKey in ["uuid", "password", "username"] where copy[secretKey] != nil {
+            copy[secretKey] = "***"
+        }
+        if var obfs = copy["obfs"] as? [String: Any], obfs["password"] != nil {
+            obfs["password"] = "***"
+            copy["obfs"] = obfs
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: copy, options: [.prettyPrinted, .sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return text
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("节点信息") {
+                    LabeledContent("名称", value: node.name)
+                    LabeledContent("协议", value: node.protocol.label)
+                    LabeledContent("地址", value: "\(node.server):\(node.port)")
+                    if let flow = parsedOutbound["flow"] as? String {
+                        LabeledContent("Flow", value: flow)
+                    }
+                    if let sni = tlsDict?["server_name"] as? String {
+                        LabeledContent("TLS SNI", value: sni)
+                    }
+                    if let reality = tlsDict?["reality"] as? [String: Any], reality["enabled"] as? Bool == true {
+                        let sid = (reality["short_id"] as? String) ?? ""
+                        LabeledContent("Reality", value: "已启用 (short_id 长度 \(sid.count))")
+                    }
+                }
+
+                if hasTls && !hasReality {
+                    Section("TLS 证书校验") {
+                        Toggle("跳过 TLS 证书验证 (skip-cert-verify)", isOn: Binding(
+                            get: { node.skipsTLSVerification },
+                            set: { engine.setNodeSkipTlsVerification(nodeId: node.id, skip: $0) }
+                        ))
+                        .tint(VpnTheme.warnAmber)
+                        Text("仅在机场使用自签证书或纯 IP TLS 节点且在 Surge 中开启了 skip-cert-verify 时启用。")
+                            .font(.caption2)
+                            .foregroundStyle(VpnTheme.textSecondary)
+                    }
+                }
+
+                Section("诊断测速") {
+                    Button {
+                        probing = true
+                        probeStatus = nil
+                        Task {
+                            let res = await engine.testNodeIsolated(node)
+                            probeStatus = res.success
+                                ? (true, "通过：\(res.countryCode ?? "?") · \(res.exitIp ?? "-") (\(res.latencyMs ?? 0)ms)")
+                                : (false, res.error ?? "测速失败")
+                            probing = false
+                        }
+                    } label: {
+                        HStack {
+                            Text(probing ? "正在通过 sing-box 探测..." : "立即测速并查看内核诊断")
+                            Spacer()
+                            if probing { ProgressView().scaleEffect(0.8) }
+                        }
+                    }
+                    .disabled(probing)
+
+                    if let probeStatus {
+                        Text(probeStatus.1)
+                            .font(.caption)
+                            .foregroundStyle(probeStatus.0 ? VpnTheme.shieldGreen : VpnTheme.killRed)
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Section("sing-box Outbound（已脱敏）") {
+                    Text(redactedPrettyJson)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(VpnTheme.textSecondary)
+                        .textSelection(.enabled)
+                }
+            }
+            .navigationTitle("节点 TLS / 配置诊断")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
         }
     }
 }

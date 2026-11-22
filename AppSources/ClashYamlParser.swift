@@ -2,6 +2,8 @@ import Foundation
 import Yams
 
 /// Parses Clash / Mihomo YAML subscription configs ("proxies:") into sing-box 1.14.4 ProxyNodes.
+/// Uses Yams.compose(yaml:) so raw scalars like Reality short-id ("00123456" / "1234e5") or numeric passwords
+/// NEVER lose leading zeros or get coerced into Int/Double.
 enum ClashYamlParser {
 
     static func looksLikeClashYaml(_ text: String) -> Bool {
@@ -18,7 +20,11 @@ enum ClashYamlParser {
 
         let loaded: Any?
         do {
-            loaded = try Yams.load(yaml: yamlText)
+            if let rootNode = try Yams.compose(yaml: yamlText) {
+                loaded = unwrapNode(rootNode)
+            } else {
+                loaded = nil
+            }
         } catch {
             return ParseBatchResult(nodes: [], errors: ["Clash YAML 解析失败: \(error.localizedDescription)"])
         }
@@ -53,6 +59,28 @@ enum ClashYamlParser {
         return ParseBatchResult(nodes: nodes, errors: errors)
     }
 
+    private static func unwrapNode(_ node: Yams.Node) -> Any {
+        if let scalar = node.scalar {
+            if scalar.style == .plain && (scalar.string == "null" || scalar.string == "~") {
+                return NSNull()
+            }
+            return scalar.string
+        }
+        if let mapping = node.mapping {
+            var dict: [String: Any] = [:]
+            for (k, v) in mapping {
+                if let key = k.string {
+                    dict[key] = unwrapNode(v)
+                }
+            }
+            return dict
+        }
+        if let seq = node.sequence {
+            return seq.map(unwrapNode)
+        }
+        return NSNull()
+    }
+
     private static func convertEntry(
         name: String,
         type: String,
@@ -66,6 +94,8 @@ enum ClashYamlParser {
             "server_port": port
         ]
         let proto: ProxyProtocol
+        let insecure = boolVal(m, "skip-cert-verify") || boolVal(m, "skip_cert_verify") || boolVal(m, "allow-insecure") || boolVal(m, "allowInsecure") || boolVal(m, "insecure")
+        let transportHost = extractTransportHost(m)
 
         switch type {
         case "vless":
@@ -75,19 +105,29 @@ enum ClashYamlParser {
             proto = .vless
             outbound["type"] = "vless"
             outbound["uuid"] = uuid
-            if let flow = str(m, "flow"), !flow.isEmpty { outbound["flow"] = flow }
-            outbound["packet_encoding"] = str(m, "packet-encoding") ?? "xudp"
+            if let flow = normalizeVlessFlow(str(m, "flow")) {
+                outbound["flow"] = flow
+            }
+            let pkt = (str(m, "packet-encoding") ?? str(m, "packet_encoding") ?? "xudp").lowercased()
+            if pkt == "xudp" || pkt == "packetaddr" {
+                outbound["packet_encoding"] = pkt
+            }
 
-            let reality = m["reality-opts"] as? [String: Any]
-            if boolVal(m, "tls") || reality != nil {
+            let reality = (m["reality-opts"] as? [String: Any]) ?? (m["reality_opts"] as? [String: Any])
+            let realityPub = reality.flatMap { str($0, "public-key") ?? str($0, "public_key") ?? str($0, "pbk") }
+            let realitySid = reality.flatMap { normalizeShortId(str($0, "short-id") ?? str($0, "short_id") ?? str($0, "sid")) }
+            let hasReality = realityPub != nil
+            if boolVal(m, "tls") || hasReality {
+                let rawFp = str(m, "client-fingerprint") ?? str(m, "fingerprint") ?? str(m, "fp")
+                let fp = normalizeFingerprint(rawFp, requiredForReality: hasReality)
                 outbound["tls"] = buildTls(
                     server: server,
-                    sni: str(m, "servername") ?? str(m, "sni"),
-                    insecure: boolVal(m, "skip-cert-verify"),
+                    sni: str(m, "servername") ?? str(m, "sni") ?? str(m, "peer") ?? transportHost,
+                    insecure: insecure,
                     alpn: strList(m, "alpn"),
-                    fp: str(m, "client-fingerprint") ?? (reality != nil ? "chrome" : nil),
-                    realityPub: reality.flatMap { str($0, "public-key") },
-                    realitySid: reality.flatMap { str($0, "short-id") }
+                    fp: fp,
+                    realityPub: realityPub,
+                    realitySid: realitySid
                 )
             }
             if let tr = buildTransport(m) { outbound["transport"] = tr }
@@ -100,14 +140,15 @@ enum ClashYamlParser {
             outbound["type"] = "vmess"
             outbound["uuid"] = uuid
             outbound["security"] = str(m, "cipher") ?? "auto"
-            outbound["alter_id"] = intVal(m, "alterId") ?? 0
+            outbound["alter_id"] = intVal(m, "alterId") ?? intVal(m, "alter-id") ?? 0
             if boolVal(m, "tls") {
+                let fp = normalizeFingerprint(str(m, "client-fingerprint") ?? str(m, "fingerprint") ?? str(m, "fp"), requiredForReality: false)
                 outbound["tls"] = buildTls(
                     server: server,
-                    sni: str(m, "servername") ?? str(m, "sni"),
-                    insecure: boolVal(m, "skip-cert-verify"),
+                    sni: str(m, "servername") ?? str(m, "sni") ?? str(m, "peer") ?? transportHost,
+                    insecure: insecure,
                     alpn: strList(m, "alpn"),
-                    fp: str(m, "client-fingerprint"),
+                    fp: fp,
                     realityPub: nil,
                     realitySid: nil
                 )
@@ -121,15 +162,19 @@ enum ClashYamlParser {
             proto = .trojan
             outbound["type"] = "trojan"
             outbound["password"] = password
-            let reality = m["reality-opts"] as? [String: Any]
+            let reality = (m["reality-opts"] as? [String: Any]) ?? (m["reality_opts"] as? [String: Any])
+            let realityPub = reality.flatMap { str($0, "public-key") ?? str($0, "public_key") ?? str($0, "pbk") }
+            let realitySid = reality.flatMap { normalizeShortId(str($0, "short-id") ?? str($0, "short_id") ?? str($0, "sid")) }
+            let hasReality = realityPub != nil
+            let fp = normalizeFingerprint(str(m, "client-fingerprint") ?? str(m, "fingerprint") ?? str(m, "fp"), requiredForReality: hasReality)
             outbound["tls"] = buildTls(
                 server: server,
-                sni: str(m, "sni") ?? str(m, "servername"),
-                insecure: boolVal(m, "skip-cert-verify"),
+                sni: str(m, "sni") ?? str(m, "servername") ?? str(m, "peer") ?? transportHost,
+                insecure: insecure,
                 alpn: strList(m, "alpn"),
-                fp: str(m, "client-fingerprint"),
-                realityPub: reality.flatMap { str($0, "public-key") },
-                realitySid: reality.flatMap { str($0, "short-id") }
+                fp: fp,
+                realityPub: realityPub,
+                realitySid: realitySid
             )
             if let tr = buildTransport(m) { outbound["transport"] = tr }
 
@@ -148,13 +193,13 @@ enum ClashYamlParser {
             outbound["password"] = str(m, "password") ?? str(m, "auth") ?? ""
             if let obfs = str(m, "obfs"), !obfs.isEmpty, obfs != "none" {
                 var o: [String: Any] = ["type": obfs]
-                if let p = str(m, "obfs-password") { o["password"] = p }
+                if let p = str(m, "obfs-password") ?? str(m, "obfs_password") { o["password"] = p }
                 outbound["obfs"] = o
             }
             outbound["tls"] = buildTls(
                 server: server,
-                sni: str(m, "sni") ?? str(m, "servername"),
-                insecure: boolVal(m, "skip-cert-verify"),
+                sni: str(m, "sni") ?? str(m, "servername") ?? str(m, "peer"),
+                insecure: insecure,
                 alpn: strList(m, "alpn"),
                 fp: nil,
                 realityPub: nil,
@@ -169,13 +214,13 @@ enum ClashYamlParser {
             outbound["type"] = "tuic"
             outbound["uuid"] = uuid
             if let pw = str(m, "password"), !pw.isEmpty { outbound["password"] = pw }
-            outbound["congestion_control"] = str(m, "congestion-controller") ?? "bbr"
-            outbound["udp_relay_mode"] = str(m, "udp-relay-mode") ?? "native"
+            outbound["congestion_control"] = str(m, "congestion-controller") ?? str(m, "congestion-control") ?? "bbr"
+            outbound["udp_relay_mode"] = str(m, "udp-relay-mode") ?? str(m, "udp_relay_mode") ?? "native"
             let alpn = strList(m, "alpn")
             outbound["tls"] = buildTls(
                 server: server,
-                sni: str(m, "sni") ?? str(m, "servername"),
-                insecure: boolVal(m, "skip-cert-verify"),
+                sni: str(m, "sni") ?? str(m, "servername") ?? str(m, "peer"),
+                insecure: insecure,
                 alpn: alpn.isEmpty ? ["h3"] : alpn,
                 fp: nil,
                 realityPub: nil,
@@ -195,7 +240,7 @@ enum ClashYamlParser {
             if let u = str(m, "username"), !u.isEmpty { outbound["username"] = u }
             if let p = str(m, "password"), !p.isEmpty { outbound["password"] = p }
             if boolVal(m, "tls") {
-                outbound["tls"] = buildTls(server: server, sni: str(m, "sni"), insecure: boolVal(m, "skip-cert-verify"), alpn: [], fp: nil, realityPub: nil, realitySid: nil)
+                outbound["tls"] = buildTls(server: server, sni: str(m, "sni") ?? str(m, "servername"), insecure: insecure, alpn: [], fp: nil, realityPub: nil, realitySid: nil)
             }
 
         default:
@@ -205,6 +250,48 @@ enum ClashYamlParser {
         let jsonData = try JSONSerialization.data(withJSONObject: outbound)
         let jsonStr = String(data: jsonData, encoding: .utf8) ?? "{}"
         return ProxyNode(name: name, protocol: proto, server: server, port: port, singBoxOutboundJson: jsonStr)
+    }
+
+    private static func normalizeVlessFlow(_ raw: String?) -> String? {
+        guard let flow = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !flow.isEmpty else { return nil }
+        let low = flow.lowercased()
+        if low == "none" { return nil }
+        if low == "xtls-rprx-vision-udp443" { return "xtls-rprx-vision" }
+        return flow
+    }
+
+    private static func normalizeFingerprint(_ raw: String?, requiredForReality: Bool) -> String? {
+        let cleaned = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let fp = cleaned, !fp.isEmpty, fp != "none" {
+            return fp == "random" ? "randomized" : fp
+        }
+        return requiredForReality ? "chrome" : nil
+    }
+
+    private static func normalizeShortId(_ raw: String?) -> String? {
+        guard let sid = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !sid.isEmpty else { return nil }
+        return sid.count % 2 == 1 ? "0" + sid : sid
+    }
+
+    private static func extractTransportHost(_ m: [String: Any]) -> String? {
+        if let ws = m["ws-opts"] as? [String: Any],
+           let headers = ws["headers"] as? [String: Any],
+           let host = str(headers, "Host") ?? str(headers, "host") {
+            return host
+        }
+        if let headers = m["ws-headers"] as? [String: Any],
+           let host = str(headers, "Host") ?? str(headers, "host") {
+            return host
+        }
+        if let h2 = m["h2-opts"] as? [String: Any], let first = strList(h2, "host").first {
+            return first
+        }
+        if let http = m["http-opts"] as? [String: Any],
+           let headers = http["headers"] as? [String: Any],
+           let first = strList(headers, "Host").first ?? strList(headers, "host").first {
+            return first
+        }
+        return nil
     }
 
     private static func buildTls(
@@ -238,12 +325,17 @@ enum ClashYamlParser {
         switch net {
         case "ws":
             let ws = m["ws-opts"] as? [String: Any]
-            let path = ws.flatMap { str($0, "path") } ?? str(m, "ws-path")
+            let rawPath = ws.flatMap { str($0, "path") } ?? str(m, "ws-path")
             let headers = (ws?["headers"] as? [String: Any]) ?? (m["ws-headers"] as? [String: Any])
             let host = headers.flatMap { str($0, "Host") ?? str($0, "host") }
             var tr: [String: Any] = ["type": "ws"]
-            if let path = path, !path.isEmpty { tr["path"] = path }
+            let (cleanPath, parsedEd) = splitWsEarlyData(rawPath)
+            if let cleanPath, !cleanPath.isEmpty { tr["path"] = cleanPath }
             if let host = host, !host.isEmpty { tr["headers"] = ["Host": host] }
+            if let maxEd = ws.flatMap({ intVal($0, "max-early-data") }) ?? parsedEd, maxEd > 0 {
+                tr["max_early_data"] = maxEd
+                tr["early_data_header_name"] = ws.flatMap({ str($0, "early-data-header-name") }) ?? "Sec-WebSocket-Protocol"
+            }
             return tr
         case "grpc":
             let grpc = m["grpc-opts"] as? [String: Any]
@@ -257,8 +349,17 @@ enum ClashYamlParser {
             if let path = h2.flatMap({ str($0, "path") }), !path.isEmpty { tr["path"] = path }
             if let hosts = h2.map({ strList($0, "host") }), !hosts.isEmpty { tr["host"] = hosts }
             return tr
+        case "http":
+            let http = m["http-opts"] as? [String: Any]
+            var tr: [String: Any] = ["type": "http"]
+            if let path = http.flatMap({ strList($0, "path").first }), !path.isEmpty { tr["path"] = path }
+            if let headers = http?["headers"] as? [String: Any] {
+                let hosts = strList(headers, "Host") + strList(headers, "host")
+                if !hosts.isEmpty { tr["host"] = hosts }
+            }
+            return tr
         case "httpupgrade":
-            let ws = m["ws-opts"] as? [String: Any]
+            let ws = (m["ws-opts"] as? [String: Any]) ?? (m["httpupgrade-opts"] as? [String: Any])
             var tr: [String: Any] = ["type": "httpupgrade"]
             if let path = ws.flatMap({ str($0, "path") }), !path.isEmpty { tr["path"] = path }
             let headers = ws?["headers"] as? [String: Any]
@@ -269,8 +370,16 @@ enum ClashYamlParser {
         }
     }
 
+    private static func splitWsEarlyData(_ rawPath: String?) -> (String?, Int?) {
+        guard let rawPath, !rawPath.isEmpty else { return (nil, nil) }
+        guard let range = rawPath.range(of: "?ed=") else { return (rawPath, nil) }
+        let base = String(rawPath[..<range.lowerBound])
+        let tail = String(rawPath[range.upperBound...]).split(separator: "&").first.map(String.init)
+        return (base.isEmpty ? "/" : base, tail.flatMap(Int.init))
+    }
+
     private static func str(_ m: [String: Any], _ key: String) -> String? {
-        guard let v = m[key] else { return nil }
+        guard let v = m[key], !(v is NSNull) else { return nil }
         let s = "\(v)".trimmingCharacters(in: .whitespacesAndNewlines)
         return s.isEmpty ? nil : s
     }
@@ -285,14 +394,14 @@ enum ClashYamlParser {
         if let b = m[key] as? Bool { return b }
         if let i = m[key] as? Int { return i != 0 }
         if let s = m[key] as? String {
-            return s.lowercased() == "true" || s == "1"
+            return s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true" || s.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
         }
         return false
     }
 
     private static func strList(_ m: [String: Any], _ key: String) -> [String] {
         if let arr = m[key] as? [Any] {
-            return arr.map { "\($0)".trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            return arr.compactMap { $0 is NSNull ? nil : "\($0)".trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         }
         if let s = m[key] as? String {
             return s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }

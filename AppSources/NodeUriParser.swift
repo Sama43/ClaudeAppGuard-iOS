@@ -67,37 +67,71 @@ enum NodeUriParser {
         }
     }
 
+    /// Splits #fragment before URLComponents parsing so unescaped spaces/Unicode in node names never fail parsing.
+    private static func splitUriAndFragment(_ raw: String) -> (URLComponents?, String?) {
+        if let hashIdx = raw.firstIndex(of: "#") {
+            let base = String(raw[..<hashIdx])
+            let frag = String(raw[raw.index(after: hashIdx)...])
+            let decodedFrag = frag.removingPercentEncoding?.nilIfEmpty ?? frag.nilIfEmpty
+            return (URLComponents(string: base), decodedFrag)
+        }
+        return (URLComponents(string: raw), nil)
+    }
+
     private static func parseVless(_ raw: String) throws -> ProxyNode {
-        guard let comps = URLComponents(string: raw),
-              let uuid = comps.user?.removingPercentEncoding, !uuid.isEmpty,
-              let host = comps.host, !host.isEmpty else {
+        let (compsOpt, fragmentName) = splitUriAndFragment(raw)
+        guard let comps = compsOpt,
+              let uuid = comps.user?.removingPercentEncoding?.nilIfEmpty,
+              let host = comps.host?.nilIfEmpty else {
             throw err("VLESS 链接缺少 UUID 或服务器地址")
         }
         let port = comps.port ?? 443
         let params = queryDict(comps)
-        let name = comps.fragment?.removingPercentEncoding?.nilIfEmpty ?? "VLESS-\(host):\(port)"
-        let security = (params["security"] ?? "none").lowercased()
+        let name = fragmentName ?? "VLESS-\(host):\(port)"
+
+        let realityPub = firstNonEmpty(params, ["pbk", "publickey", "public-key", "public_key"])
+        let realitySid = normalizeShortId(firstNonEmpty(params, ["sid", "shortid", "short-id", "short_id"]))
+        let rawSec = (firstNonEmpty(params, ["security"]) ?? (realityPub != nil ? "reality" : (isTruthy(firstNonEmpty(params, ["tls"])) ? "tls" : "none"))).lowercased()
+        let isReality = rawSec == "reality" || realityPub != nil
+        let hasTls = isReality || rawSec == "tls" || rawSec == "xtls"
 
         var outbound: [String: Any] = [
             "type": "vless",
             "tag": "proxy",
             "server": host,
             "server_port": port,
-            "uuid": uuid,
-            "packet_encoding": params["packetEncoding"] ?? "xudp"
+            "uuid": uuid
         ]
-        if let flow = params["flow"], !flow.isEmpty { outbound["flow"] = flow }
-        if security == "tls" || security == "reality" {
+        let pkt = (firstNonEmpty(params, ["packetencoding", "packet-encoding", "packet_encoding"]) ?? "xudp").lowercased()
+        if pkt == "xudp" || pkt == "packetaddr" {
+            outbound["packet_encoding"] = pkt
+        }
+        if let flow = normalizeVlessFlow(firstNonEmpty(params, ["flow"])) {
+            outbound["flow"] = flow
+        }
+        if hasTls {
+            let sni = firstNonEmpty(params, ["sni", "servername", "peer", "host"]) ?? host
+            let insecure = isTruthy(firstNonEmpty(params, ["allowinsecure", "insecure", "skip-cert-verify", "skip_cert_verify", "allow_insecure"]))
+            let fp = normalizeFingerprint(firstNonEmpty(params, ["fp", "fingerprint", "client-fingerprint"]), requiredForReality: isReality)
             outbound["tls"] = buildTls(
-                serverName: params["sni"] ?? params["host"] ?? host,
-                insecure: isTruthy(params["allowInsecure"] ?? params["insecure"]),
-                alpn: params["alpn"],
-                fp: params["fp"] ?? (security == "reality" ? "chrome" : nil),
-                realityPub: security == "reality" ? params["pbk"] : nil,
-                realitySid: security == "reality" ? params["sid"] : nil
+                serverName: sni,
+                insecure: insecure,
+                alpn: firstNonEmpty(params, ["alpn"]),
+                fp: fp,
+                realityPub: isReality ? realityPub : nil,
+                realitySid: isReality ? realitySid : nil
             )
         }
-        if let tr = buildTransport(type: (params["type"] ?? "tcp").lowercased(), path: params["path"], hostHeader: params["host"] ?? params["sni"], serviceName: params["serviceName"]) {
+        let netType = (firstNonEmpty(params, ["type", "net"]) ?? "tcp").lowercased()
+        let headerType = (firstNonEmpty(params, ["headertype"]) ?? "").lowercased()
+        let hostHeader = firstNonEmpty(params, ["host", "sni", "servername"])
+        if let tr = buildTransport(
+            type: netType,
+            headerType: headerType,
+            path: firstNonEmpty(params, ["path"]),
+            hostHeader: hostHeader,
+            serviceName: firstNonEmpty(params, ["servicename", "service-name"])
+        ) {
             outbound["transport"] = tr
         }
         return ProxyNode(name: name, protocol: .vless, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
@@ -116,6 +150,7 @@ enum NodeUriParser {
         let aid = Int("\(obj["aid"] ?? 0)") ?? 0
         let scy = (obj["scy"] as? String)?.nilIfEmpty ?? "auto"
         let net = ((obj["net"] as? String) ?? "tcp").lowercased()
+        let headerType = ((obj["type"] as? String) ?? "").lowercased()
         let tls = ((obj["tls"] as? String) ?? "").lowercased()
         let sni = (obj["sni"] as? String)?.nilIfEmpty ?? (obj["host"] as? String)?.nilIfEmpty ?? host
         let name = (obj["ps"] as? String)?.nilIfEmpty ?? "VMess-\(host):\(port)"
@@ -130,31 +165,36 @@ enum NodeUriParser {
             "alter_id": aid
         ]
         if tls == "tls" {
+            let insecure = isTruthy(obj["allowInsecure"].map { "\($0)" } ?? obj["skip-cert-verify"].map { "\($0)" })
             outbound["tls"] = buildTls(
                 serverName: sni,
-                insecure: isTruthy(obj["allowInsecure"] as? String),
-                alpn: obj["alpn"] as? String,
-                fp: obj["fp"] as? String,
+                insecure: insecure,
+                alpn: (obj["alpn"] as? String)?.nilIfEmpty,
+                fp: normalizeFingerprint(obj["fp"] as? String, requiredForReality: false),
                 realityPub: nil,
                 realitySid: nil
             )
         }
-        if let tr = buildTransport(type: net, path: obj["path"] as? String, hostHeader: obj["host"] as? String, serviceName: obj["path"] as? String) {
+        if let tr = buildTransport(type: net, headerType: headerType, path: (obj["path"] as? String)?.nilIfEmpty, hostHeader: (obj["host"] as? String)?.nilIfEmpty, serviceName: (obj["path"] as? String)?.nilIfEmpty) {
             outbound["transport"] = tr
         }
         return ProxyNode(name: name, protocol: .vmess, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
     }
 
     private static func parseTrojan(_ raw: String) throws -> ProxyNode {
-        guard let comps = URLComponents(string: raw),
-              let password = comps.user?.removingPercentEncoding, !password.isEmpty,
-              let host = comps.host, !host.isEmpty else {
+        let (compsOpt, fragmentName) = splitUriAndFragment(raw)
+        guard let comps = compsOpt,
+              let password = comps.user?.removingPercentEncoding?.nilIfEmpty,
+              let host = comps.host?.nilIfEmpty else {
             throw err("Trojan 链接缺少密码或服务器")
         }
         let port = comps.port ?? 443
         let params = queryDict(comps)
-        let name = comps.fragment?.removingPercentEncoding?.nilIfEmpty ?? "Trojan-\(host):\(port)"
-        let security = (params["security"] ?? "tls").lowercased()
+        let name = fragmentName ?? "Trojan-\(host):\(port)"
+        let realityPub = firstNonEmpty(params, ["pbk", "publickey", "public-key"])
+        let realitySid = normalizeShortId(firstNonEmpty(params, ["sid", "shortid", "short-id"]))
+        let security = (firstNonEmpty(params, ["security"]) ?? (realityPub != nil ? "reality" : "tls")).lowercased()
+        let isReality = security == "reality" || realityPub != nil
 
         var outbound: [String: Any] = [
             "type": "trojan",
@@ -164,16 +204,23 @@ enum NodeUriParser {
             "password": password
         ]
         if security != "none" {
+            let insecure = isTruthy(firstNonEmpty(params, ["allowinsecure", "insecure", "skip-cert-verify", "skip_cert_verify"]))
             outbound["tls"] = buildTls(
-                serverName: params["sni"] ?? params["peer"] ?? host,
-                insecure: isTruthy(params["allowInsecure"] ?? params["insecure"]),
-                alpn: params["alpn"],
-                fp: params["fp"],
-                realityPub: security == "reality" ? params["pbk"] : nil,
-                realitySid: security == "reality" ? params["sid"] : nil
+                serverName: firstNonEmpty(params, ["sni", "peer", "servername", "host"]) ?? host,
+                insecure: insecure,
+                alpn: firstNonEmpty(params, ["alpn"]),
+                fp: normalizeFingerprint(firstNonEmpty(params, ["fp", "fingerprint", "client-fingerprint"]), requiredForReality: isReality),
+                realityPub: isReality ? realityPub : nil,
+                realitySid: isReality ? realitySid : nil
             )
         }
-        if let tr = buildTransport(type: (params["type"] ?? "tcp").lowercased(), path: params["path"], hostHeader: params["host"] ?? params["sni"], serviceName: params["serviceName"]) {
+        if let tr = buildTransport(
+            type: (firstNonEmpty(params, ["type", "net"]) ?? "tcp").lowercased(),
+            headerType: (firstNonEmpty(params, ["headertype"]) ?? "").lowercased(),
+            path: firstNonEmpty(params, ["path"]),
+            hostHeader: firstNonEmpty(params, ["host", "sni", "peer"]),
+            serviceName: firstNonEmpty(params, ["servicename", "service-name"])
+        ) {
             outbound["transport"] = tr
         }
         return ProxyNode(name: name, protocol: .trojan, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
@@ -183,7 +230,7 @@ enum NodeUriParser {
         let withoutScheme = String(raw.dropFirst("ss://".count))
         let fragSplit = withoutScheme.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
         let mainPart = String(fragSplit[0]).split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
-        let name = fragSplit.count > 1 ? String(fragSplit[1]).removingPercentEncoding?.nilIfEmpty : nil
+        let name = fragSplit.count > 1 ? (String(fragSplit[1]).removingPercentEncoding?.nilIfEmpty ?? String(fragSplit[1]).nilIfEmpty) : nil
 
         let method: String
         let password: String
@@ -225,14 +272,15 @@ enum NodeUriParser {
 
     private static func parseHysteria2(_ raw: String) throws -> ProxyNode {
         let normalized = raw.lowercased().hasPrefix("hy2://") ? "hysteria2://" + raw.dropFirst(6) : raw
-        guard let comps = URLComponents(string: normalized),
-              let host = comps.host, !host.isEmpty else {
+        let (compsOpt, fragmentName) = splitUriAndFragment(normalized)
+        guard let comps = compsOpt,
+              let host = comps.host?.nilIfEmpty else {
             throw err("Hysteria2 缺少服务器")
         }
         let port = comps.port ?? 443
         let password = comps.user?.removingPercentEncoding ?? ""
         let params = queryDict(comps)
-        let name = comps.fragment?.removingPercentEncoding?.nilIfEmpty ?? "Hy2-\(host):\(port)"
+        let name = fragmentName ?? "Hy2-\(host):\(port)"
 
         var outbound: [String: Any] = [
             "type": "hysteria2",
@@ -241,32 +289,33 @@ enum NodeUriParser {
             "server_port": port,
             "password": password,
             "tls": buildTls(
-                serverName: params["sni"] ?? host,
-                insecure: isTruthy(params["insecure"] ?? params["allowInsecure"]),
-                alpn: params["alpn"],
+                serverName: firstNonEmpty(params, ["sni", "servername", "peer"]) ?? host,
+                insecure: isTruthy(firstNonEmpty(params, ["insecure", "allowinsecure", "skip-cert-verify", "skip_cert_verify"])),
+                alpn: firstNonEmpty(params, ["alpn"]),
                 fp: nil,
                 realityPub: nil,
                 realitySid: nil
             )
         ]
-        if let obfs = params["obfs"], !obfs.isEmpty, obfs != "none" {
+        if let obfs = firstNonEmpty(params, ["obfs"]), obfs.lowercased() != "none" {
             var o: [String: Any] = ["type": obfs]
-            if let p = params["obfs-password"] { o["password"] = p }
+            if let p = firstNonEmpty(params, ["obfs-password", "obfs_password"]) { o["password"] = p }
             outbound["obfs"] = o
         }
         return ProxyNode(name: name, protocol: .hysteria2, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
     }
 
     private static func parseTuic(_ raw: String) throws -> ProxyNode {
-        guard let comps = URLComponents(string: raw),
-              let uuid = comps.user?.removingPercentEncoding, !uuid.isEmpty,
-              let host = comps.host, !host.isEmpty else {
+        let (compsOpt, fragmentName) = splitUriAndFragment(raw)
+        guard let comps = compsOpt,
+              let uuid = comps.user?.removingPercentEncoding?.nilIfEmpty,
+              let host = comps.host?.nilIfEmpty else {
             throw err("TUIC 缺少参数")
         }
         let port = comps.port ?? 443
         let password = comps.password?.removingPercentEncoding ?? ""
         let params = queryDict(comps)
-        let name = comps.fragment?.removingPercentEncoding?.nilIfEmpty ?? "TUIC-\(host):\(port)"
+        let name = fragmentName ?? "TUIC-\(host):\(port)"
 
         var outbound: [String: Any] = [
             "type": "tuic",
@@ -274,12 +323,12 @@ enum NodeUriParser {
             "server": host,
             "server_port": port,
             "uuid": uuid,
-            "congestion_control": params["congestion_control"] ?? "bbr",
-            "udp_relay_mode": params["udp_relay_mode"] ?? "native",
+            "congestion_control": firstNonEmpty(params, ["congestion_control", "congestion-control"]) ?? "bbr",
+            "udp_relay_mode": firstNonEmpty(params, ["udp_relay_mode", "udp-relay-mode"]) ?? "native",
             "tls": buildTls(
-                serverName: params["sni"] ?? host,
-                insecure: isTruthy(params["allow_insecure"] ?? params["insecure"]),
-                alpn: params["alpn"] ?? "h3",
+                serverName: firstNonEmpty(params, ["sni", "servername", "peer"]) ?? host,
+                insecure: isTruthy(firstNonEmpty(params, ["allow_insecure", "allowinsecure", "insecure", "skip-cert-verify"])),
+                alpn: firstNonEmpty(params, ["alpn"]) ?? "h3",
                 fp: nil,
                 realityPub: nil,
                 realitySid: nil
@@ -290,11 +339,12 @@ enum NodeUriParser {
     }
 
     private static func parseSocks5(_ raw: String) throws -> ProxyNode {
-        guard let comps = URLComponents(string: raw), let host = comps.host, !host.isEmpty else {
+        let (compsOpt, fragmentName) = splitUriAndFragment(raw)
+        guard let comps = compsOpt, let host = comps.host?.nilIfEmpty else {
             throw err("SOCKS5 缺少服务器")
         }
         let port = comps.port ?? 1080
-        let name = comps.fragment?.removingPercentEncoding?.nilIfEmpty ?? "SOCKS5-\(host):\(port)"
+        let name = fragmentName ?? "SOCKS5-\(host):\(port)"
         var outbound: [String: Any] = [
             "type": "socks",
             "tag": "proxy",
@@ -308,12 +358,13 @@ enum NodeUriParser {
     }
 
     private static func parseHttp(_ raw: String) throws -> ProxyNode {
-        guard let comps = URLComponents(string: raw), let host = comps.host, !host.isEmpty else {
+        let (compsOpt, fragmentName) = splitUriAndFragment(raw)
+        guard let comps = compsOpt, let host = comps.host?.nilIfEmpty else {
             throw err("HTTP 代理缺少服务器")
         }
         let isHttps = comps.scheme?.lowercased() == "https"
         let port = comps.port ?? (isHttps ? 443 : 8080)
-        let name = comps.fragment?.removingPercentEncoding?.nilIfEmpty ?? "HTTP-\(host):\(port)"
+        let name = fragmentName ?? "HTTP-\(host):\(port)"
         var outbound: [String: Any] = [
             "type": "http",
             "tag": "proxy",
@@ -372,6 +423,26 @@ enum NodeUriParser {
         return ParseBatchResult(nodes: nodes, errors: [])
     }
 
+    private static func normalizeVlessFlow(_ raw: String?) -> String? {
+        guard let flow = raw?.nilIfEmpty else { return nil }
+        let low = flow.lowercased()
+        if low == "none" { return nil }
+        if low == "xtls-rprx-vision-udp443" { return "xtls-rprx-vision" }
+        return flow
+    }
+
+    private static func normalizeFingerprint(_ raw: String?, requiredForReality: Bool) -> String? {
+        if let fp = raw?.nilIfEmpty?.lowercased(), fp != "none" {
+            return fp == "random" ? "randomized" : fp
+        }
+        return requiredForReality ? "chrome" : nil
+    }
+
+    private static func normalizeShortId(_ raw: String?) -> String? {
+        guard let sid = raw?.nilIfEmpty else { return nil }
+        return sid.count % 2 == 1 ? "0" + sid : sid
+    }
+
     private static func buildTls(
         serverName: String?,
         insecure: Bool,
@@ -381,55 +452,87 @@ enum NodeUriParser {
         realitySid: String?
     ) -> [String: Any] {
         var tls: [String: Any] = ["enabled": true]
-        if let sni = serverName, !sni.isEmpty { tls["server_name"] = sni }
+        if let sni = serverName?.nilIfEmpty { tls["server_name"] = sni }
         if insecure { tls["insecure"] = true }
-        if let alpn = alpn, !alpn.isEmpty {
+        if let alpn = alpn?.nilIfEmpty {
             let list = alpn.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             if !list.isEmpty { tls["alpn"] = list }
         }
-        if let fp = fp, !fp.isEmpty {
+        if let fp = fp?.nilIfEmpty {
             tls["utls"] = ["enabled": true, "fingerprint": fp]
         }
-        if let pub = realityPub, !pub.isEmpty {
+        if let pub = realityPub?.nilIfEmpty {
             var r: [String: Any] = ["enabled": true, "public_key": pub]
-            if let sid = realitySid, !sid.isEmpty { r["short_id"] = sid }
+            if let sid = realitySid?.nilIfEmpty { r["short_id"] = sid }
             tls["reality"] = r
         }
         return tls
     }
 
-    private static func buildTransport(type: String, path: String?, hostHeader: String?, serviceName: String?) -> [String: Any]? {
+    private static func buildTransport(type: String, headerType: String, path: String?, hostHeader: String?, serviceName: String?) -> [String: Any]? {
         switch type {
         case "ws", "websocket":
             var tr: [String: Any] = ["type": "ws"]
-            if let path = path, !path.isEmpty { tr["path"] = path }
-            if let host = hostHeader, !host.isEmpty { tr["headers"] = ["Host": host] }
+            let (cleanPath, maxEd) = splitWsEarlyData(path)
+            if let cleanPath, !cleanPath.isEmpty { tr["path"] = cleanPath }
+            if let host = hostHeader?.nilIfEmpty { tr["headers"] = ["Host": host] }
+            if let maxEd, maxEd > 0 {
+                tr["max_early_data"] = maxEd
+                tr["early_data_header_name"] = "Sec-WebSocket-Protocol"
+            }
             return tr
         case "grpc":
             var tr: [String: Any] = ["type": "grpc"]
-            if let svc = serviceName, !svc.isEmpty { tr["service_name"] = svc }
+            if let svc = serviceName?.nilIfEmpty { tr["service_name"] = svc }
             return tr
         case "httpupgrade":
             var tr: [String: Any] = ["type": "httpupgrade"]
-            if let path = path, !path.isEmpty { tr["path"] = path }
-            if let host = hostHeader, !host.isEmpty { tr["host"] = host }
+            if let path = path?.nilIfEmpty { tr["path"] = path }
+            if let host = hostHeader?.nilIfEmpty { tr["host"] = host }
             return tr
         case "h2", "http":
             var tr: [String: Any] = ["type": "http"]
-            if let path = path, !path.isEmpty { tr["path"] = path }
-            if let host = hostHeader, !host.isEmpty { tr["host"] = [host] }
+            if let path = path?.nilIfEmpty { tr["path"] = path }
+            if let host = hostHeader?.nilIfEmpty { tr["host"] = [host] }
             return tr
+        case "tcp":
+            if headerType == "http" {
+                var tr: [String: Any] = ["type": "http"]
+                if let path = path?.nilIfEmpty { tr["path"] = path }
+                if let host = hostHeader?.nilIfEmpty { tr["host"] = [host] }
+                return tr
+            }
+            return nil
         default:
             return nil
         }
     }
 
+    private static func splitWsEarlyData(_ rawPath: String?) -> (String?, Int?) {
+        guard let rawPath = rawPath?.nilIfEmpty else { return (nil, nil) }
+        guard let range = rawPath.range(of: "?ed=") else { return (rawPath, nil) }
+        let base = String(rawPath[..<range.lowerBound])
+        let tail = String(rawPath[range.upperBound...]).split(separator: "&").first.map(String.init)
+        return (base.isEmpty ? "/" : base, tail.flatMap(Int.init))
+    }
+
     private static func queryDict(_ comps: URLComponents) -> [String: String] {
         var dict: [String: String] = [:]
         for item in comps.queryItems ?? [] {
-            if let v = item.value { dict[item.name] = v }
+            if let v = item.value?.nilIfEmpty {
+                dict[item.name.lowercased()] = v
+            }
         }
         return dict
+    }
+
+    private static func firstNonEmpty(_ dict: [String: String], _ keys: [String]) -> String? {
+        for key in keys {
+            if let val = dict[key.lowercased()]?.nilIfEmpty {
+                return val
+            }
+        }
+        return nil
     }
 
     private static func splitHostPort(_ hp: String) throws -> (String, Int) {
@@ -461,8 +564,8 @@ enum NodeUriParser {
     }
 
     private static func isTruthy(_ v: String?) -> Bool {
-        guard let v = v?.lowercased() else { return false }
-        return v == "1" || v == "true"
+        guard let v = v?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return false }
+        return v == "1" || v == "true" || v == "yes"
     }
 
     private static func toJson(_ obj: [String: Any]) -> String {

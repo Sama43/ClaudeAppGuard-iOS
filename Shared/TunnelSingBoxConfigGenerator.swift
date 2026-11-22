@@ -57,7 +57,7 @@ enum TunnelSingBoxConfigGenerator {
         }
 
         let root: [String: Any] = [
-            "log": ["level": "warn", "timestamp": false],
+            "log": ["level": "info", "timestamp": false],
             "dns": [
                 "servers": [
                     ["tag": "dns_remote", "type": "https", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query", "detour": "proxy"],

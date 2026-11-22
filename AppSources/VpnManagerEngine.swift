@@ -646,6 +646,32 @@ final class VpnManagerEngine: ObservableObject {
         } catch { recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription) }
     }
 
+    func setNodeSkipTlsVerification(nodeId: UUID, skip: Bool) {
+        guard let idx = nodes.firstIndex(where: { $0.id == nodeId }),
+              let data = nodes[idx].singBoxOutboundJson.data(using: .utf8),
+              var outbound = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var tls = outbound["tls"] as? [String: Any] else { return }
+        if skip {
+            tls["insecure"] = true
+        } else {
+            tls.removeValue(forKey: "insecure")
+        }
+        outbound["tls"] = tls
+        guard let nextData = try? JSONSerialization.data(withJSONObject: outbound),
+              let nextJson = String(data: nextData, encoding: .utf8) else { return }
+        var updated = nodes
+        updated[idx].singBoxOutboundJson = nextJson
+        do {
+            try commitCatalog(nodes: updated, subscriptions: subscriptions)
+            recordLocalEvent(.warn, tag: "NODES", "已\(skip ? "开启" : "关闭")「\(updated[idx].name)」跳过 TLS 证书验证")
+            if activeSession?.boundNodeId == nodeId && vpnStatus == .connected {
+                pushCurrentPayloadToRunningTunnel()
+            }
+        } catch {
+            recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription)
+        }
+    }
+
     func testNodeIsolated(_ node: ProxyNode) async -> ExitCheckResult {
         guard runningNodeTests < 3 else { return ExitCheckResult(success: false, error: "已有 3 个测速任务，请稍后再试") }
         runningNodeTests += 1
@@ -663,8 +689,19 @@ final class VpnManagerEngine: ObservableObject {
         let handle = String(resp.dropFirst(3))
 
         try? await Task.sleep(nanoseconds: 250_000_000)
-        let check = await ExitIpVerifier.verify(corePort: port, enrichGeo: true, timeoutSec: 8)
-        await Task.detached { CorebridgeStopTempCore(handle) }.value
+        var check = await ExitIpVerifier.verify(corePort: port, enrichGeo: true, timeoutSec: 8)
+        let rawCoreLogs: String = await Task.detached {
+            let logs = CorebridgeGetTempCoreLogs(handle)
+            CorebridgeStopTempCore(handle)
+            return logs
+        }.value
+        if !check.success {
+            let diagLine = Self.extractCoreErrorHint(from: rawCoreLogs)
+            if let diagLine {
+                check.error = "\(check.error ?? "测速失败") | sing-box: \(diagLine)"
+                recordLocalEvent(.warn, tag: "PROBE", "「\(node.name)」测速内核日志: \(diagLine)")
+            }
+        }
         if check.success, let idx = nodes.firstIndex(where: { $0.id == node.id }) {
             var measured = nodes
             measured[idx].lastLatencyMs = check.latencyMs
@@ -675,6 +712,22 @@ final class VpnManagerEngine: ObservableObject {
             catch { recordLocalEvent(.warn, tag: "STORAGE", error.localizedDescription) }
         }
         return check
+    }
+
+    private static func extractCoreErrorHint(from rawLogs: String) -> String? {
+        let lines = rawLogs
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return nil }
+        let keywords = ["x509", "tls", "reality", "certificate", "handshake", "vless", "error", "eof", "refused", "reset", "timeout", "short_id", "flow"]
+        if let hit = lines.last(where: { line in
+            let low = line.lowercased()
+            return keywords.contains { low.contains($0) }
+        }) {
+            return String(hit.suffix(180))
+        }
+        return lines.last.map { String($0.suffix(180)) }
     }
 
     func updateSettings(_ mutate: (inout VpnGuardSettings) -> Void) {

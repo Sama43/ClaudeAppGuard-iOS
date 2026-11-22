@@ -39,19 +39,45 @@ type CommandHandler interface {
 }
 
 var (
-	mu           sync.Mutex
-	activeBox    *box.Box
-	tempBoxes    = make(map[string]*box.Box)
-	tempCounter  int64
-	logMu        sync.Mutex
-	logLines     []string
-	statusMu     sync.RWMutex
-	statusJSON   string
-	statusETag   string
+	mu             sync.Mutex
+	activeBox      *box.Box
+	tempBoxes      = make(map[string]*box.Box)
+	tempLogs       = make(map[string]*ringLogWriter)
+	tempCounter    int64
+	logMu          sync.Mutex
+	logLines       []string
+	statusMu       sync.RWMutex
+	statusJSON     string
+	statusETag     string
 	statusRevision uint64
-	statusServer *http.Server
-	statusLn     net.Listener
+	statusServer   *http.Server
+	statusLn       net.Listener
 )
+
+type ringLogWriter struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (w *ringLogWriter) DisableColors() bool { return true }
+func (w *ringLogWriter) WriteMessage(level boxlog.Level, message string) {
+	msg := strings.TrimSpace(message)
+	if msg == "" {
+		return
+	}
+	w.mu.Lock()
+	w.lines = append(w.lines, msg)
+	if len(w.lines) > 40 {
+		w.lines = w.lines[len(w.lines)-40:]
+	}
+	w.mu.Unlock()
+}
+
+func (w *ringLogWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return strings.Join(w.lines, "\n")
+}
 
 func appendLog(msg string) {
 	msg = strings.TrimSpace(msg)
@@ -294,7 +320,7 @@ func (p *iosTunPlatform) CreateBridge(opts adapter.BridgeOptions) (adapter.Bridg
 	return nil, os.ErrInvalid
 }
 
-func startInstance(configJSON string, tunFd int32, captureLogs bool) (*box.Box, error) {
+func startInstance(configJSON string, tunFd int32, logWriter boxlog.PlatformWriter) (*box.Box, error) {
 	ctx := include.Context(context.Background())
 	if tunFd >= 0 {
 		service.MustRegister[adapter.PlatformInterface](ctx, &iosTunPlatform{tunFd: tunFd})
@@ -307,8 +333,8 @@ func startInstance(configJSON string, tunFd int32, captureLogs bool) (*box.Box, 
 		Context: ctx,
 		Options: options,
 	}
-	if captureLogs {
-		boxOpts.PlatformLogWriter = &bridgeLogWriter{}
+	if logWriter != nil {
+		boxOpts.PlatformLogWriter = logWriter
 	}
 	instance, err := box.New(boxOpts)
 	if err != nil {
@@ -333,7 +359,7 @@ func StartTunnelCore(configJSON string, tunFd int32) string {
 		debug.FreeOSMemory()
 	}
 
-	instance, err := startInstance(configJSON, tunFd, true)
+	instance, err := startInstance(configJSON, tunFd, &bridgeLogWriter{})
 	if err != nil {
 		appendLog("ERROR: " + err.Error())
 		return err.Error()
@@ -377,7 +403,8 @@ func IsRunning() bool {
 
 // StartTempCore starts an isolated non-TUN sing-box instance for node testing. Returns "OK:<id>" or "ERR:<msg>".
 func StartTempCore(configJSON string) string {
-	instance, err := startInstance(configJSON, -1, false)
+	lw := &ringLogWriter{}
+	instance, err := startInstance(configJSON, -1, lw)
 	if err != nil {
 		return "ERR:" + err.Error()
 	}
@@ -386,7 +413,18 @@ func StartTempCore(configJSON string) string {
 	tempCounter++
 	id := fmt.Sprintf("tmp_%d", tempCounter)
 	tempBoxes[id] = instance
+	tempLogs[id] = lw
 	return "OK:" + id
+}
+
+func GetTempCoreLogs(handleID string) string {
+	mu.Lock()
+	lw := tempLogs[handleID]
+	mu.Unlock()
+	if lw == nil {
+		return ""
+	}
+	return lw.String()
 }
 
 func StopTempCore(handleID string) {
@@ -395,6 +433,7 @@ func StopTempCore(handleID string) {
 	if ok {
 		delete(tempBoxes, handleID)
 	}
+	delete(tempLogs, handleID)
 	mu.Unlock()
 	if ok && inst != nil {
 		_ = inst.Close()
