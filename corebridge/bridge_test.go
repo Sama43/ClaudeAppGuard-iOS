@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -49,4 +50,29 @@ func TestGuardStartsSealedWithExistingCache(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestTempCoreUsesTempCachePathInsteadOfCwd(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	roDir := t.TempDir()
+	if err := os.Chmod(roDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(roDir, 0o755) }()
+	if err := os.Chdir(roDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(cwd) }()
+
+	cfg := `{"log":{"level":"info","timestamp":false},"outbounds":[{"type":"socks","tag":"proxy","server":"127.0.0.1","server_port":1080}]}`
+	resp := StartTempCore(cfg)
+	if !strings.HasPrefix(resp, "OK:") {
+		t.Fatalf("StartTempCore failed in read-only cwd: %s", resp)
+	}
+	handle := strings.TrimPrefix(resp, "OK:")
+	_ = GetTempCoreLogs(handle)
+	StopTempCore(handle)
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ var (
 	activeBox      *box.Box
 	tempBoxes      = make(map[string]*box.Box)
 	tempLogs       = make(map[string]*ringLogWriter)
+	tempCaches     = make(map[string]string)
 	tempCounter    int64
 	logMu          sync.Mutex
 	logLines       []string
@@ -320,7 +322,7 @@ func (p *iosTunPlatform) CreateBridge(opts adapter.BridgeOptions) (adapter.Bridg
 	return nil, os.ErrInvalid
 }
 
-func startInstance(configJSON string, tunFd int32, logWriter boxlog.PlatformWriter) (*box.Box, error) {
+func startInstance(configJSON string, tunFd int32, logWriter boxlog.PlatformWriter, fallbackCachePath string) (*box.Box, error) {
 	ctx := include.Context(context.Background())
 	if tunFd >= 0 {
 		service.MustRegister[adapter.PlatformInterface](ctx, &iosTunPlatform{tunFd: tunFd})
@@ -328,6 +330,18 @@ func startInstance(configJSON string, tunFd int32, logWriter boxlog.PlatformWrit
 	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(configJSON))
 	if err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	// sing-box v1.14+ auto-initializes cache-file whenever PlatformLogWriter != nil;
+	// ensure CacheFile.Path points to a writable sandbox temp path instead of read-only cwd "cache.db".
+	if logWriter != nil && fallbackCachePath != "" {
+		if options.Experimental == nil {
+			options.Experimental = &option.ExperimentalOptions{}
+		}
+		if options.Experimental.CacheFile == nil {
+			options.Experimental.CacheFile = &option.CacheFileOptions{Enabled: true, Path: fallbackCachePath}
+		} else if options.Experimental.CacheFile.Path == "" {
+			options.Experimental.CacheFile.Path = fallbackCachePath
+		}
 	}
 	boxOpts := box.Options{
 		Context: ctx,
@@ -359,7 +373,8 @@ func StartTunnelCore(configJSON string, tunFd int32) string {
 		debug.FreeOSMemory()
 	}
 
-	instance, err := startInstance(configJSON, tunFd, &bridgeLogWriter{})
+	fallbackCache := filepath.Join(os.TempDir(), "cg-tunnel-fallback.db")
+	instance, err := startInstance(configJSON, tunFd, &bridgeLogWriter{}, fallbackCache)
 	if err != nil {
 		appendLog("ERROR: " + err.Error())
 		return err.Error()
@@ -403,17 +418,23 @@ func IsRunning() bool {
 
 // StartTempCore starts an isolated non-TUN sing-box instance for node testing. Returns "OK:<id>" or "ERR:<msg>".
 func StartTempCore(configJSON string) string {
+	mu.Lock()
+	tempCounter++
+	id := fmt.Sprintf("tmp_%d", tempCounter)
+	mu.Unlock()
+
+	cachePath := filepath.Join(os.TempDir(), fmt.Sprintf("cg-probe-%s-%d.db", id, time.Now().UnixNano()))
 	lw := &ringLogWriter{}
-	instance, err := startInstance(configJSON, -1, lw)
+	instance, err := startInstance(configJSON, -1, lw, cachePath)
 	if err != nil {
+		_ = os.Remove(cachePath)
 		return "ERR:" + err.Error()
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	tempCounter++
-	id := fmt.Sprintf("tmp_%d", tempCounter)
 	tempBoxes[id] = instance
 	tempLogs[id] = lw
+	tempCaches[id] = cachePath
 	return "OK:" + id
 }
 
@@ -434,9 +455,14 @@ func StopTempCore(handleID string) {
 		delete(tempBoxes, handleID)
 	}
 	delete(tempLogs, handleID)
+	cachePath := tempCaches[handleID]
+	delete(tempCaches, handleID)
 	mu.Unlock()
 	if ok && inst != nil {
 		_ = inst.Close()
+	}
+	if cachePath != "" {
+		_ = os.Remove(cachePath)
 	}
 }
 
