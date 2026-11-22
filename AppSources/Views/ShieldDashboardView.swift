@@ -75,6 +75,23 @@ struct ShieldDashboardView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             }
 
+            if let banner = engine.flushStatusBanner {
+                HStack(alignment: .top, spacing: 6) {
+                    Text(banner.message)
+                        .font(.caption2)
+                        .foregroundStyle(banner.isSuccess ? VpnTheme.shieldGreen : VpnTheme.warnAmber)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 4)
+                    Button { engine.flushStatusBanner = nil } label: {
+                        Image(systemName: "xmark").font(.caption2).foregroundStyle(VpnTheme.textSecondary)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(banner.isSuccess ? VpnTheme.shieldGreenBg : VpnTheme.warnAmberBg)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+
             if engine.snapshot.status == .protected {
                 Button {
                     if let url = URL(string: "claude://") {
@@ -88,6 +105,16 @@ struct ShieldDashboardView: View {
                         .background(VpnTheme.shieldGreen)
                         .foregroundStyle(VpnTheme.bgDark)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+
+                Button { engine.flushClaudeBackgroundConnections() } label: {
+                    Label("一键切断 Claude 后台连接（清零长连接）", systemImage: "bolt.slash.fill")
+                        .font(.caption.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(VpnTheme.warnAmberBg)
+                        .foregroundStyle(VpnTheme.warnAmber)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
 
                 HStack(spacing: 10) {
@@ -224,7 +251,7 @@ struct ShieldDashboardView: View {
     private var architectureNoteCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("iOS 黑洞防直连机制说明").font(.caption.bold()).foregroundStyle(VpnTheme.accentTeal)
-            Text("隧道启动时先封锁目标流量，出口通过校验后才放行。断网恢复后会重新校验；巡检连续两次超时会封锁并自动重试。手动熔断、地区或锁定 IP 不符时，需要手动重新校验。")
+            Text("隧道启动时先封锁目标流量，出口通过校验后才放行。断网恢复后会重新校验；巡检首次偶发超时会 1 秒内立即复检，连续两次失败才黑洞封锁并自动重试。手动熔断、地区或锁定 IP 不符时需手动恢复。iOS 系统沙盒限制第三方 App 无法直接删除其他 App 的多任务后台卡片，但「一键切断 Claude 后台连接」与「关闭 VPN」都会通过 sing-box 内核瞬间强制 RST 断开官方 Claude 全部后台长连接。")
                 .font(.caption2)
                 .foregroundStyle(VpnTheme.textSecondary)
                 .lineSpacing(3)

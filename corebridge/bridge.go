@@ -56,6 +56,34 @@ var (
 	statusLn       net.Listener
 )
 
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, '\x1b') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
+				i++
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func shouldDropLogLevel(level boxlog.Level) bool {
+	switch level {
+	case boxlog.LevelDebug, boxlog.LevelTrace:
+		return true
+	default:
+		return false
+	}
+}
+
 type ringLogWriter struct {
 	mu    sync.Mutex
 	lines []string
@@ -63,7 +91,10 @@ type ringLogWriter struct {
 
 func (w *ringLogWriter) DisableColors() bool { return true }
 func (w *ringLogWriter) WriteMessage(level boxlog.Level, message string) {
-	msg := strings.TrimSpace(message)
+	if shouldDropLogLevel(level) {
+		return
+	}
+	msg := strings.TrimSpace(stripANSI(message))
 	if msg == "" {
 		return
 	}
@@ -82,7 +113,7 @@ func (w *ringLogWriter) String() string {
 }
 
 func appendLog(msg string) {
-	msg = strings.TrimSpace(msg)
+	msg = strings.TrimSpace(stripANSI(msg))
 	if msg == "" {
 		return
 	}
@@ -99,6 +130,9 @@ type bridgeLogWriter struct{}
 
 func (w *bridgeLogWriter) DisableColors() bool { return true }
 func (w *bridgeLogWriter) WriteMessage(level boxlog.Level, message string) {
+	if shouldDropLogLevel(level) {
+		return
+	}
 	appendLog(message)
 }
 

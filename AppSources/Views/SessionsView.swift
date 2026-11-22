@@ -21,6 +21,23 @@ struct SessionsView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .padding(.horizontal)
 
+                if let banner = engine.flushStatusBanner {
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(banner.message)
+                            .font(.caption2)
+                            .foregroundStyle(banner.isSuccess ? VpnTheme.shieldGreen : VpnTheme.warnAmber)
+                        Spacer(minLength: 4)
+                        Button { engine.flushStatusBanner = nil } label: {
+                            Image(systemName: "xmark").font(.caption2).foregroundStyle(VpnTheme.textSecondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(banner.isSuccess ? VpnTheme.shieldGreenBg : VpnTheme.warnAmberBg)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .padding(.horizontal)
+                }
+
                 if engine.nodes.isEmpty {
                     Spacer()
                     Button("前往导入节点") { selectedTab = 2 }
@@ -49,6 +66,17 @@ struct SessionsView: View {
             .navigationTitle("官方客户端身份会话")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if engine.vpnStatus == .connected {
+                        Button {
+                            engine.flushClaudeBackgroundConnections()
+                        } label: {
+                            Label("断 Claude 连接", systemImage: "bolt.slash.fill")
+                                .font(.caption)
+                        }
+                        .tint(VpnTheme.warnAmber)
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showCreate = true } label: { Image(systemName: "plus") }
                         .disabled(engine.nodes.isEmpty)

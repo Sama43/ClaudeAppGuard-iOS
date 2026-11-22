@@ -17,6 +17,7 @@ final class VpnManagerEngine: ObservableObject {
     @Published var localEvents: [SecurityEvent] = []
     @Published private(set) var catalogError: String?
     @Published var lastDisconnectError: String? = nil
+    @Published var flushStatusBanner: (isSuccess: Bool, message: String)? = nil
 
     let resolvedExtensionId: String = SharedConstants.resolvedTunnelBundleId()
     let appGroupAvailable: Bool = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: SharedConstants.appGroupId) != nil
@@ -285,6 +286,7 @@ final class VpnManagerEngine: ObservableObject {
 
         userRequestedStop = false
         lastDisconnectError = nil
+        flushStatusBanner = nil
         pendingAutoRetrySessionId = allowAutoRetry ? sessionId : nil
         activeSessionId = session.id
         storage.saveActiveSessionId(session.id)
@@ -422,6 +424,19 @@ final class VpnManagerEngine: ObservableObject {
         sendTunnelCommand("kill_switch")
     }
 
+    /// Forcibly severs all active & background TCP/TLS/WebSocket connections of the official Claude app at the sing-box tunnel layer.
+    /// Note: iOS sandbox prevents any third-party app from removing another app's process card from the multitasking switcher.
+    func flushClaudeBackgroundConnections() {
+        guard vpnStatus == .connected else {
+            flushStatusBanner = (false, "隔离 VPN 未运行：无法通过内核切断连接。如需退出后台，请上滑多任务划掉官方 Claude。")
+            recordLocalEvent(.warn, tag: "FLUSH", "VPN 未连接，无法执行内核级 Claude 后台断连")
+            return
+        }
+        sendTunnelCommand("flush_claude_connections")
+        flushStatusBanner = (true, "已强制切断官方 Claude 全部前台/后台长连接（注：iOS 系统限制无法自动划掉多任务卡片）")
+        recordLocalEvent(.info, tag: "FLUSH", "已向内核发送一键切断官方 Claude 后台连接指令")
+    }
+
     func reverifyAndRecover() {
         if vpnStatus == .connected {
             sendTunnelCommand("reverify")
@@ -433,12 +448,22 @@ final class VpnManagerEngine: ObservableObject {
     func stopVpnCompletely() {
         userRequestedStop = true
         startAttemptId &+= 1
+        let attempt = startAttemptId
         pendingAutoRetrySessionId = nil
         startupWatchTask?.cancel()
-        manager?.connection.stopVPNTunnel()
+        if vpnStatus == .connected {
+            sendTunnelCommand("kill_switch")
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                guard let self, self.startAttemptId == attempt else { return }
+                self.manager?.connection.stopVPNTunnel()
+            }
+        } else {
+            manager?.connection.stopVPNTunnel()
+        }
         snapshot.status = .stopped
         snapshot.killSwitchReason = nil
-        recordLocalEvent(.info, tag: "VPN", "已完全关闭系统 VPN")
+        recordLocalEvent(.info, tag: "VPN", "已先切断 Claude 后台连接并关闭系统 VPN")
     }
 
     private func sendReloadPayload(_ payloadData: Data) {
@@ -673,6 +698,9 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     func testNodeIsolated(_ node: ProxyNode) async -> ExitCheckResult {
+        if vpnStatus == .connected && settings.globalMode && snapshot.status == .blackholeKillSwitch {
+            return ExitCheckResult(success: false, error: "当前处于「全局黑洞熔断」状态，已拦截整机出口；请先关闭全局模式或停止 VPN 后再测速")
+        }
         guard runningNodeTests < 3 else { return ExitCheckResult(success: false, error: "已有 3 个测速任务，请稍后再试") }
         runningNodeTests += 1
         defer { runningNodeTests -= 1 }
@@ -714,20 +742,28 @@ final class VpnManagerEngine: ObservableObject {
         return check
     }
 
+    private static func stripANSI(_ text: String) -> String {
+        text.replacingOccurrences(of: #"\u{001B}\[[0-9;]*[A-Za-z]"#, with: "", options: .regularExpression)
+    }
+
     private static func extractCoreErrorHint(from rawLogs: String) -> String? {
         let lines = rawLogs
             .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .map { stripANSI($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { line in
+                guard !line.isEmpty else { return false }
+                let low = line.lowercased()
+                return !low.contains("trace[") && !low.contains("debug[") && !low.contains("xtlspadding") && !low.contains("xtlsfiltertls")
+            }
         guard !lines.isEmpty else { return nil }
-        let keywords = ["x509", "tls", "reality", "certificate", "handshake", "vless", "error", "eof", "refused", "reset", "timeout", "short_id", "flow"]
+        let errorKeywords = ["error", "fatal", "warn", "x509", "certificate", "handshake", "eof", "refused", "reset", "timeout", "short_id", "reality", "failed", "unreachable", "denied"]
         if let hit = lines.last(where: { line in
             let low = line.lowercased()
-            return keywords.contains { low.contains($0) }
+            return errorKeywords.contains { low.contains($0) }
         }) {
             return String(hit.suffix(180))
         }
-        return lines.last.map { String($0.suffix(180)) }
+        return nil
     }
 
     func updateSettings(_ mutate: (inout VpnGuardSettings) -> Void) {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
+	boxlog "github.com/sagernet/sing-box/log"
 )
 
 // Exercise the actual iOS-generated routing config and cache across two starts.
@@ -75,4 +76,18 @@ func TestTempCoreUsesTempCachePathInsteadOfCwd(t *testing.T) {
 	handle := strings.TrimPrefix(resp, "OK:")
 	_ = GetTempCoreLogs(handle)
 	StopTempCore(handle)
+}
+
+func TestLogFilteringAndANSIStripping(t *testing.T) {
+	lw := &ringLogWriter{}
+	lw.WriteMessage(boxlog.LevelTrace, "\x1b[37mTRACE\x1b[0m[0000] outbound/vless[proxy]: XtlsPadding 1523 210 0")
+	lw.WriteMessage(boxlog.LevelDebug, "\x1b[37mDEBUG\x1b[0m[0000] connection: download finished")
+	lw.WriteMessage(boxlog.LevelError, "\x1b[31mERROR\x1b[0m[0000] dial tcp: i/o timeout")
+	got := lw.String()
+	if strings.Contains(got, "XtlsPadding") || strings.Contains(got, "DEBUG") {
+		t.Fatalf("expected trace/debug logs to be filtered, got: %q", got)
+	}
+	if got != "ERROR[0000] dial tcp: i/o timeout" {
+		t.Fatalf("unexpected stripped log: %q", got)
+	}
 }

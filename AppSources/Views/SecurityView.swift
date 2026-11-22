@@ -87,8 +87,12 @@ struct SecurityView: View {
                         Text("实时安全审计日志")
                         Spacer()
                         Button("复制") {
-                            let text = engine.combinedEvents.map { "[\(Self.ts($0.timestamp))][\($0.tag)] \($0.message)" }.joined(separator: "\n")
-                            UIPasteboard.general.string = text
+                            if logTab == 0 {
+                                let text = engine.combinedEvents.map { "[\(Self.ts($0.timestamp))][\($0.tag)] \($0.message)" }.joined(separator: "\n")
+                                UIPasteboard.general.string = text
+                            } else {
+                                UIPasteboard.general.string = engine.snapshot.coreLogs.joined(separator: "\n")
+                            }
                         }.font(.caption)
                         Button("清空") { engine.clearLogs() }.font(.caption).foregroundStyle(VpnTheme.killRed)
                     }

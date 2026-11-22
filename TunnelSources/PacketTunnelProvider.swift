@@ -28,6 +28,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var offline = false
     private var lastInterface: NWInterface.InterfaceType?
     private var retryIndex = 0
+    private var consecutiveProbeFailures = 0
     private var snapshotRevision: UInt64 = 0
     private var envelope: LoopbackEnvelope?
     private var lastCommand: UInt64 = 0
@@ -59,6 +60,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.offline = false
             self.lastInterface = nil
             self.retryIndex = 0
+            self.consecutiveProbeFailures = 0
             self.snapshotRevision = 0
             guard let node = self.currentNode else {
                 completionHandler(self.failure("未找到已绑定节点，请返回 App 重新选择"))
@@ -173,6 +175,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         switch cmd {
         case "kill_switch":
             lockTraffic("已手动熔断，请手动重新校验", manual: true)
+        case "flush_claude_connections":
+            flushClaudeConnections()
         case "reverify":
             lastLockDecision = sequence
             manuallyLocked = false
@@ -252,6 +256,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func flushClaudeConnections() {
+        let wasProtected = snapshot.status == .protected && !manuallyLocked && !offline
+        guard seal() else { return }
+        if wasProtected {
+            let ticket = generation
+            let targetProxy = proxyTag
+            recordEvent(.info, tag: "FLUSH", "已瞬间强制切断官方 Claude 全部前台/后台连接，正在恢复隔离守护...")
+            queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
+                guard let self, self.generation == ticket, !self.manuallyLocked, !self.offline,
+                      self.snapshot.status == .protected, self.proxyTag == targetProxy else { return }
+                guard CorebridgeSelectGuardOutbound(targetProxy) else {
+                    self.lockTraffic("切断连接后恢复出口失败，请重新校验", manual: true)
+                    return
+                }
+                self.recordEvent(.success, tag: "FLUSH", "官方 Claude 后台连接已清零，隔离守护已恢复")
+            }
+        } else {
+            recordEvent(.info, tag: "FLUSH", "官方 Claude 全部后台连接已处于黑洞封锁清零状态")
+        }
+    }
+
     private func beginVerification() {
         invalidateChecks()
         guard !manuallyLocked else { return }
@@ -261,6 +286,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             catch { lockTraffic(error.localizedDescription, manual: true); return }
         }
         retryIndex = 0
+        consecutiveProbeFailures = 0
         snapshot.status = .verifyingExit
         snapshot.killSwitchReason = nil
         recordEvent(.info, tag: "VERIFY", "正在通过已绑定节点校验出口")
@@ -273,7 +299,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         checkTask = Task {
             do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
             catch { return }
-            let result = await ExitIpVerifier.verify(corePort: port, enrichGeo: false, timeoutSec: 4)
+            let result = await ExitIpVerifier.verify(corePort: port, enrichGeo: false, timeoutSec: 6)
             guard !Task.isCancelled else { return }
             self.queue.async {
                 guard ticket == self.generation, !self.offline, !self.manuallyLocked else { return }
@@ -285,15 +311,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func applyCheck(_ result: ExitCheckResult) {
         let wasProtected = snapshot.status == .protected
         guard result.success, let ip = result.exitIp, let country = result.countryCode else {
-            // Fail-closed immediately on the very first missed probe (zero grace window!).
-            // Because guard selector flips instantaneously without tearing down utun, auto-retry recovers quickly.
             let errDetail = result.error.map { "：\($0)" } ?? ""
-            lockTraffic("出口校验超时/断线\(errDetail)，已瞬时黑洞封锁并自动重试", manual: false)
+            // While already protected, guard routes exclusively via proxyTag (never direct), so a single transient
+            // probe timeout cannot leak direct traffic. Confirm once immediately after 1s before sealing.
+            if wasProtected && consecutiveProbeFailures == 0 {
+                consecutiveProbeFailures = 1
+                recordEvent(.warn, tag: "VERIFY", "出口巡检偶发波动 (1/2)\(errDetail)，1 秒后立即复检")
+                scheduleCheck(after: 1)
+                return
+            }
+            consecutiveProbeFailures += 1
+            lockTraffic("出口校验连续失败/断线\(errDetail)，已黑洞封锁并自动重试", manual: false)
             let delays = [2, 5, 10, 20]
             scheduleCheck(after: delays[retryIndex])
             retryIndex = min(retryIndex + 1, delays.count - 1)
             return
         }
+        consecutiveProbeFailures = 0
         let ipChanged = snapshot.exitIp != ip
         snapshot.exitIp = ip
         snapshot.exitCountry = country
