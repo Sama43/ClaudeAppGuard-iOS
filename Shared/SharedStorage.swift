@@ -16,6 +16,7 @@ final class SharedStorage {
         static let subscriptions = "cag_ios_subs_v1"
         static let sessions = "cag_ios_sessions_v1"
         static let activeSessionId = "cag_ios_active_session_v1"
+        static let activeNodeId = "cag_ios_active_node_v1"
         static let settings = "cag_ios_settings_v1"
         static let snapshot = "cag_ios_tunnel_snapshot_v1"
     }
@@ -57,6 +58,28 @@ final class SharedStorage {
         for name in [Keys.nodes, Keys.subscriptions] where defaults.object(forKey: name) != nil {
             defaults.removeObject(forKey: name)
         }
+    }
+
+    func loadActiveNodeId() -> UUID? {
+        if let saved = defaults.string(forKey: Keys.activeNodeId).flatMap(UUID.init) {
+            return saved
+        }
+        // Seamless one-time migration from legacy identity sessions so existing users keep their bound node.
+        let legacySessions = loadSessions()
+        if let sid = loadActiveSessionId(),
+           let bound = legacySessions.first(where: { $0.id == sid })?.boundNodeId {
+            saveActiveNodeId(bound)
+            return bound
+        }
+        if let firstBound = legacySessions.first?.boundNodeId {
+            saveActiveNodeId(firstBound)
+            return firstBound
+        }
+        return nil
+    }
+
+    func saveActiveNodeId(_ id: UUID?) {
+        defaults.set(id?.uuidString, forKey: Keys.activeNodeId)
     }
 
     func loadSessions() -> [AppIdentitySession] { load(Keys.sessions) ?? [] }

@@ -137,12 +137,21 @@ struct NodesView: View {
 
                         ForEach(filtered) { node in
                             let testing = testingIds.contains(node.id)
+                            let isSelected = engine.activeNodeId == node.id
+                            let isProtected = isSelected && engine.snapshot.status == .protected
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
                                     Text(node.protocol.label).font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
                                         .background(VpnTheme.accentTealBg).foregroundStyle(VpnTheme.accentTeal).clipShape(RoundedRectangle(cornerRadius: 5))
                                     Text(node.name).font(.subheadline.bold()).foregroundStyle(VpnTheme.textPrimary).lineLimit(1)
                                     Spacer()
+                                    if isProtected {
+                                        Text("守护中").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
+                                            .background(VpnTheme.shieldGreenBg).foregroundStyle(VpnTheme.shieldGreen).clipShape(Capsule())
+                                    } else if isSelected {
+                                        Text("当前节点").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
+                                            .background(VpnTheme.accentTealBg).foregroundStyle(VpnTheme.accentTeal).clipShape(Capsule())
+                                    }
                                 }
                                 Text("\(node.server):\(node.port)").font(.caption2).foregroundStyle(VpnTheme.textSecondary).lineLimit(1)
                                 if node.skipsTLSVerification { Text("此节点已关闭 TLS 证书验证").font(.caption2).foregroundStyle(VpnTheme.killRed) }
@@ -154,9 +163,9 @@ struct NodesView: View {
                                         engine.connectNodeShortcut(node.id)
                                         selectedTab = 0
                                     } label: {
-                                        Text("以此节点隔离官方 Claude")
+                                        Text(isProtected ? "当前守护节点" : "以此节点隔离官方 Claude")
                                             .font(.caption.bold()).frame(maxWidth: .infinity).padding(.vertical, 7)
-                                            .background(VpnTheme.accentTeal).foregroundStyle(VpnTheme.bgDark).clipShape(RoundedRectangle(cornerRadius: 8))
+                                            .background(isProtected ? VpnTheme.shieldGreen : VpnTheme.accentTeal).foregroundStyle(VpnTheme.bgDark).clipShape(RoundedRectangle(cornerRadius: 8))
                                     }
                                     Button {
                                         testingIds.insert(node.id)
@@ -183,7 +192,7 @@ struct NodesView: View {
                                 }
                             }
                             .padding(12).background(VpnTheme.surfaceDark)
-                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(VpnTheme.borderDark, lineWidth: 1))
+                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(isProtected ? VpnTheme.shieldGreen.opacity(0.7) : VpnTheme.borderDark, lineWidth: isProtected ? 1.2 : 1))
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                         }
                     }

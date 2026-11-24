@@ -148,7 +148,7 @@ struct ShieldDashboardView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                 }
                 HStack(spacing: 10) {
-                    Button("切换身份/节点") { selectedTab = 1 }
+                    Button("切换节点") { selectedTab = 1 }
                         .font(.caption.bold())
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 9)
@@ -164,23 +164,11 @@ struct ShieldDashboardView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
             } else if engine.snapshot.status == .stopped {
-                if let sess = engine.activeSession ?? engine.sessions.first {
+                if let targetNode = engine.activeNode ?? engine.nodes.first {
                     Button {
-                        engine.startProtection(forSessionId: sess.id)
+                        engine.startProtection(forNodeId: targetNode.id)
                     } label: {
-                        Label("开启隔离守护 (\(sess.name))", systemImage: "play.fill")
-                            .font(.subheadline.bold())
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 11)
-                            .background(VpnTheme.accentTeal)
-                            .foregroundStyle(VpnTheme.bgDark)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }
-                } else if let firstNode = engine.nodes.first {
-                    Button {
-                        engine.connectNodeShortcut(firstNode.id)
-                    } label: {
-                        Label("开启隔离守护 (\(firstNode.name))", systemImage: "play.fill")
+                        Label("开启隔离守护 (\(targetNode.name))", systemImage: "play.fill")
                             .font(.subheadline.bold())
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 11)
@@ -190,7 +178,7 @@ struct ShieldDashboardView: View {
                     }
                 } else {
                     Button {
-                        selectedTab = 2
+                        selectedTab = 1
                     } label: {
                         Label("先去导入机场订阅 / 代理节点", systemImage: "icloud.and.arrow.down")
                             .font(.subheadline.bold())
@@ -275,9 +263,9 @@ struct ShieldDashboardView: View {
     private var subtitleText: String {
         switch engine.snapshot.status {
         case .protected:
-            let sess = engine.snapshot.activeSessionName.map { "身份: \($0)\n" } ?? ""
+            let nodeLine = engine.snapshot.activeNodeName.map { "节点: \($0)\n" } ?? ""
             let loc = [engine.snapshot.exitCountry, engine.snapshot.exitIp, engine.snapshot.exitCity].compactMap { $0 }.joined(separator: " · ")
-            return "\(sess)出口 \(loc) (\(engine.snapshot.latencyMs ?? 0)ms)\n后台每 \(engine.settings.watchdogIntervalSec) 秒持续防封巡检中"
+            return "\(nodeLine)出口 \(loc) (\(engine.snapshot.latencyMs ?? 0)ms)\n后台每 \(engine.settings.watchdogIntervalSec) 秒持续防封巡检中"
         case .blackholeKillSwitch:
             return engine.snapshot.killSwitchReason ?? "Claude 流量已被黑洞拦截，零直连泄露"
         case .startingCore, .verifyingExit:

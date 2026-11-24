@@ -49,9 +49,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let startup = self.generation
             let payload = self.resolveLaunchPayload(options: options)
             self.settings = payload?.settings ?? self.storage.loadSettings()
-            let savedId = self.storage.loadActiveSessionId()
-            self.currentSession = payload?.session ?? self.storage.loadSessions().first { $0.id == savedId }
-            let nodeId = self.currentSession?.boundNodeId
+            self.currentSession = payload?.session
+            let nodeId = self.storage.loadActiveNodeId()
             self.currentNode = payload?.node ?? (try? self.storage.loadCatalog())?.nodes.first { $0.id == nodeId }
             self.envelope = nil
             self.lastCommand = 0
@@ -63,11 +62,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.consecutiveProbeFailures = 0
             self.snapshotRevision = 0
             guard let node = self.currentNode else {
-                completionHandler(self.failure("未找到已绑定节点，请返回 App 重新选择"))
+                completionHandler(self.failure("未找到已选节点，请返回 App 重新选择"))
                 return
             }
-            self.snapshot = TunnelSnapshot(status: .startingCore, activeSessionId: self.currentSession?.id,
-                                          activeSessionName: self.currentSession?.name, activeNodeName: node.name)
+            self.snapshot = TunnelSnapshot(status: .startingCore, activeSessionId: nil,
+                                          activeSessionName: nil, activeNodeName: node.name)
             self.setTunnelNetworkSettings(self.buildTunnelNetworkSettings()) { error in
                 self.queue.async {
                     guard self.generation == startup else {
@@ -183,12 +182,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard seal() else { return }
             beginVerification()
         case "reload":
-            guard let session = storage.loadSessions().first(where: { $0.id == storage.loadActiveSessionId() }),
-                  let node = (try? storage.loadCatalog())?.nodes.first(where: { $0.id == session.boundNodeId }) else {
-                lockTraffic("已绑定节点不存在，请重新绑定", manual: true)
+            guard let nodeId = storage.loadActiveNodeId() ?? currentNode?.id,
+                  let node = (try? storage.loadCatalog())?.nodes.first(where: { $0.id == nodeId }) else {
+                lockTraffic("当前节点不存在，已保持黑洞封锁，请重新选择节点", manual: true)
                 return
             }
-            reload(node: node, session: session, settings: storage.loadSettings())
+            reload(node: node, session: nil, settings: storage.loadSettings())
         default:
             let activate = cmd.hasPrefix("activate_payload:")
             let prefix = activate ? "activate_payload:" : "reload_payload:"

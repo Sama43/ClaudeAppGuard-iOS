@@ -11,9 +11,8 @@ final class VpnManagerEngine: ObservableObject {
     @Published var vpnStatus: NEVPNStatus = .disconnected
     @Published var nodes: [ProxyNode] = []
     @Published var subscriptions: [SubscriptionProfile] = []
-    @Published var sessions: [AppIdentitySession] = []
     @Published var settings: VpnGuardSettings = VpnGuardSettings()
-    @Published var activeSessionId: UUID? = nil
+    @Published var activeNodeId: UUID? = nil
     @Published var localEvents: [SecurityEvent] = []
     @Published private(set) var catalogError: String?
     @Published var lastDisconnectError: String? = nil
@@ -34,9 +33,9 @@ final class VpnManagerEngine: ObservableObject {
         }
     }
 
-    var activeSession: AppIdentitySession? {
-        guard let id = activeSessionId else { return nil }
-        return sessions.first { $0.id == id }
+    var activeNode: ProxyNode? {
+        guard let id = activeNodeId else { return nil }
+        return nodes.first { $0.id == id }
     }
 
     var combinedEvents: [SecurityEvent] {
@@ -49,7 +48,7 @@ final class VpnManagerEngine: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var startupWatchTask: Task<Void, Never>?
     private var userRequestedStop = false
-    private var pendingAutoRetrySessionId: UUID? = nil
+    private var pendingAutoRetryNodeId: UUID? = nil
     private var lastAppliedSnapshotRevision: UInt64 = 0
     private var lastAppliedSnapshotDate: Date = .distantPast
     private var currentControlToken: String = ""
@@ -69,9 +68,8 @@ final class VpnManagerEngine: ObservableObject {
 
     init() {
         loadCatalog()
-        self.sessions = storage.loadSessions()
         self.settings = storage.loadSettings()
-        self.activeSessionId = storage.loadActiveSessionId()
+        self.activeNodeId = storage.loadActiveNodeId()
         self.snapshot = storage.loadSnapshot()
         self.snapshot.status = .stopped
 
@@ -176,7 +174,7 @@ final class VpnManagerEngine: ObservableObject {
                 switch newStatus {
                 case .connected:
                     self.startupWatchTask?.cancel()
-                    self.pendingAutoRetrySessionId = nil
+                    self.pendingAutoRetryNodeId = nil
                     self.lastDisconnectError = nil
                     Task { @MainActor [weak self] in
                         try? await Task.sleep(nanoseconds: 350_000_000)
@@ -209,12 +207,12 @@ final class VpnManagerEngine: ObservableObject {
                     let msg = "\(nsErr.localizedDescription) (domain=\(nsErr.domain), code=\(nsErr.code))"
                     // Auto-retry ONCE on initial iOS neagent code=12 (profile registration race right after saveToPreferences)
                     if nsErr.domain == NEVPNConnectionErrorDomain && nsErr.code == 12,
-                       let retrySid = self.pendingAutoRetrySessionId {
-                        self.pendingAutoRetrySessionId = nil
+                       let retryNid = self.pendingAutoRetryNodeId {
+                        self.pendingAutoRetryNodeId = nil
                         self.recordLocalEvent(.warn, tag: "VPN", "首次拉起遇到系统 code=12，0.6 秒后自动重试...")
                         Task { @MainActor [weak self] in
                             try? await Task.sleep(nanoseconds: 600_000_000)
-                            self?.startProtection(forSessionId: retrySid, allowAutoRetry: false)
+                            self?.startProtection(forNodeId: retryNid, allowAutoRetry: false)
                         }
                         return
                     }
@@ -277,30 +275,35 @@ final class VpnManagerEngine: ObservableObject {
 
     // MARK: - VPN Control
 
-    func startProtection(forSessionId sessionId: UUID, allowAutoRetry: Bool = true) {
-        guard let session = sessions.first(where: { $0.id == sessionId }),
-              let node = nodes.first(where: { $0.id == session.boundNodeId }) else {
-            recordLocalEvent(.warn, tag: "VPN", "该身份未绑定有效节点")
+    func startProtection(forNodeId nodeId: UUID, allowAutoRetry: Bool = true) {
+        guard let node = nodes.first(where: { $0.id == nodeId }) else {
+            recordLocalEvent(.warn, tag: "VPN", "所选节点不存在，请重新选择")
             return
+        }
+
+        let switchedToDifferentNode = activeNodeId != nil && activeNodeId != node.id
+        if switchedToDifferentNode && settings.lockExitIp {
+            var nextSettings = settings
+            nextSettings.lockExitIp = false
+            nextSettings.pinnedExitIp = nil
+            settings = nextSettings
+            storage.saveSettings(nextSettings)
+            recordLocalEvent(.info, tag: "IP_LOCK", "已切换到新节点，自动解除旧节点的出口 IP 锁定")
         }
 
         userRequestedStop = false
         lastDisconnectError = nil
         flushStatusBanner = nil
-        pendingAutoRetrySessionId = allowAutoRetry ? sessionId : nil
-        activeSessionId = session.id
-        storage.saveActiveSessionId(session.id)
-        if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
-            sessions[idx].lastUsedAt = Date()
-            storage.saveSessions(sessions)
-        }
+        pendingAutoRetryNodeId = allowAutoRetry ? node.id : nil
+        activeNodeId = node.id
+        storage.saveActiveNodeId(node.id)
 
         if vpnStatus == .connected {
-            let livePayload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: currentControlToken)
+            let livePayload = TunnelLaunchPayload(node: node, session: nil, settings: settings, controlToken: currentControlToken)
             if let liveData = try? JSONEncoder().encode(livePayload) {
                 persistLiveConfiguration(payloadData: liveData, server: node.server)
                 sendTunnelCommand("activate_payload:" + liveData.base64EncodedString())
-                recordLocalEvent(.info, tag: "IDENTITY", "正在切换官方客户端身份 -> 「\(session.name)」")
+                recordLocalEvent(.info, tag: "VPN", "正在黑洞保护下切换节点 -> 「\(node.name)」")
             }
             return
         }
@@ -314,7 +317,7 @@ final class VpnManagerEngine: ObservableObject {
         snapshotETag = nil
         lastAppliedSnapshotRevision = 0
         currentControlToken = freshToken
-        let payload = TunnelLaunchPayload(node: node, session: session, settings: settings, controlToken: freshToken)
+        let payload = TunnelLaunchPayload(node: node, session: nil, settings: settings, controlToken: freshToken)
         guard let payloadData = try? JSONEncoder().encode(payload) else {
             recordLocalEvent(.critical, tag: "VPN", "编码隧道配置失败")
             return
@@ -331,8 +334,8 @@ final class VpnManagerEngine: ObservableObject {
 
         lastAppliedSnapshotDate = .distantPast
         snapshot.status = .startingCore
-        snapshot.activeSessionId = session.id
-        snapshot.activeSessionName = session.name
+        snapshot.activeSessionId = nil
+        snapshot.activeSessionName = nil
         snapshot.activeNodeName = node.name
         snapshot.killSwitchReason = nil
 
@@ -412,12 +415,7 @@ final class VpnManagerEngine: ObservableObject {
     }
 
     func connectNodeShortcut(_ nodeId: UUID) {
-        if let existing = sessions.first(where: { $0.boundNodeId == nodeId }) {
-            startProtection(forSessionId: existing.id)
-        } else if let node = nodes.first(where: { $0.id == nodeId }) {
-            let created = createSession(name: String(node.name.prefix(18)), accountHint: "", boundNodeId: node.id)
-            startProtection(forSessionId: created.id)
-        }
+        startProtection(forNodeId: nodeId)
     }
 
     func tripBlackholeKillSwitch() {
@@ -440,8 +438,8 @@ final class VpnManagerEngine: ObservableObject {
     func reverifyAndRecover() {
         if vpnStatus == .connected {
             sendTunnelCommand("reverify")
-        } else if let sid = activeSessionId ?? sessions.first?.id {
-            startProtection(forSessionId: sid)
+        } else if let nid = activeNodeId ?? nodes.first?.id {
+            startProtection(forNodeId: nid)
         }
     }
 
@@ -449,7 +447,7 @@ final class VpnManagerEngine: ObservableObject {
         userRequestedStop = true
         startAttemptId &+= 1
         let attempt = startAttemptId
-        pendingAutoRetrySessionId = nil
+        pendingAutoRetryNodeId = nil
         startupWatchTask?.cancel()
         if vpnStatus == .connected {
             sendTunnelCommand("kill_switch")
@@ -473,9 +471,8 @@ final class VpnManagerEngine: ObservableObject {
 
     private func pushCurrentPayloadToRunningTunnel() {
         guard vpnStatus == .connected,
-              let sess = activeSession,
-              let node = nodes.first(where: { $0.id == sess.boundNodeId }),
-              let data = try? JSONEncoder().encode(TunnelLaunchPayload(node: node, session: sess, settings: settings, controlToken: currentControlToken)) else {
+              let node = activeNode,
+              let data = try? JSONEncoder().encode(TunnelLaunchPayload(node: node, session: nil, settings: settings, controlToken: currentControlToken)) else {
             return
         }
         persistLiveConfiguration(payloadData: data, server: node.server)
@@ -528,64 +525,7 @@ final class VpnManagerEngine: ObservableObject {
         }
     }
 
-    // MARK: - Sessions, Nodes & Subscriptions
-
-    @discardableResult
-    func createSession(name: String, accountHint: String, boundNodeId: UUID) -> AppIdentitySession {
-        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sess = AppIdentitySession(
-            name: clean.isEmpty ? "官方身份 #\(sessions.count + 1)" : clean,
-            accountHint: accountHint.trimmingCharacters(in: .whitespacesAndNewlines),
-            boundNodeId: boundNodeId
-        )
-        sessions.append(sess)
-        storage.saveSessions(sessions)
-        recordLocalEvent(.success, tag: "IDENTITY", "已创建官方客户端身份「\(sess.name)」")
-        return sess
-    }
-
-    func rebindSessionNode(sessionId: UUID, newNodeId: UUID) {
-        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        sessions[idx].boundNodeId = newNodeId
-        sessions[idx].lockExitIp = false
-        sessions[idx].pinnedExitIp = nil
-        storage.saveSessions(sessions)
-        if activeSessionId == sessionId && vpnStatus == .connected {
-            pushCurrentPayloadToRunningTunnel()
-        }
-    }
-
-    func pinSessionExitIp(sessionId: UUID, ip: String) {
-        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        sessions[idx].lockExitIp = true
-        sessions[idx].pinnedExitIp = ip
-        storage.saveSessions(sessions)
-        if activeSessionId == sessionId && vpnStatus == .connected {
-            pushCurrentPayloadToRunningTunnel()
-        }
-    }
-
-    func clearSessionExitIp(sessionId: UUID) {
-        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        sessions[idx].lockExitIp = false
-        sessions[idx].pinnedExitIp = nil
-        storage.saveSessions(sessions)
-        if activeSessionId == sessionId && vpnStatus == .connected {
-            pushCurrentPayloadToRunningTunnel()
-        }
-    }
-
-    func deleteSession(_ sessionId: UUID) {
-        if activeSessionId == sessionId {
-            if vpnStatus == .connected {
-                tripBlackholeKillSwitch()
-            }
-            activeSessionId = nil
-            storage.saveActiveSessionId(nil)
-        }
-        sessions.removeAll { $0.id == sessionId }
-        storage.saveSessions(sessions)
-    }
+    // MARK: - Nodes & Subscriptions
 
     func importNodesFromText(_ rawText: String) -> ParseBatchResult {
         let res = NodeUriParser.parseInput(rawText)
@@ -634,7 +574,7 @@ final class VpnManagerEngine: ObservableObject {
         let existingNodes = nodes.filter { $0.subscriptionId == profile.id }
         let tagged = SubscriptionNodeMerge.merge(batch.nodes, with: existingNodes, subscriptionId: profile.id)
         let removedNodeIds = Set(existingNodes.map(\.id)).subtracting(tagged.map(\.id))
-        let affectedSessions = sessions.filter { removedNodeIds.contains($0.boundNodeId) }
+        let activeRemoved = activeNodeId.map { removedNodeIds.contains($0) } ?? false
         var updated = profile
         if updated.name == "机场订阅", let s = meta.suggestedName, !s.isEmpty { updated.name = s }
         updated.lastUpdated = Date()
@@ -650,22 +590,32 @@ final class VpnManagerEngine: ObservableObject {
         try commitCatalog(nodes: nodes.filter { $0.subscriptionId != profile.id } + tagged, subscriptions: nextSubscriptions)
 
         recordLocalEvent(.success, tag: "SUB", "订阅「\(updated.name)」已更新 \(tagged.count) 个节点")
-        if affectedSessions.contains(where: { $0.id == activeSessionId }) { tripBlackholeKillSwitch() }
-        if !affectedSessions.isEmpty {
-            recordLocalEvent(.warn, tag: "SUB", "订阅更新后有 \(affectedSessions.count) 个身份的原节点已不存在，请重新绑定")
+        if activeRemoved {
+            tripBlackholeKillSwitch()
+            activeNodeId = nil
+            storage.saveActiveNodeId(nil)
+            recordLocalEvent(.warn, tag: "SUB", "订阅更新后原守护节点已不存在，已保持黑洞封锁防直连，请重新选择节点")
         }
         return (updated, tagged.count)
     }
 
     func deleteSubscription(_ subId: UUID) {
-        if let activeSession, nodes.contains(where: { $0.subscriptionId == subId && $0.id == activeSession.boundNodeId }) { tripBlackholeKillSwitch() }
+        if let activeId = activeNodeId, nodes.contains(where: { $0.subscriptionId == subId && $0.id == activeId }) {
+            tripBlackholeKillSwitch()
+            activeNodeId = nil
+            storage.saveActiveNodeId(nil)
+        }
         do {
             try commitCatalog(nodes: nodes.filter { $0.subscriptionId != subId }, subscriptions: subscriptions.filter { $0.id != subId })
         } catch { recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription) }
     }
 
     func deleteNode(_ nodeId: UUID) {
-        if activeSession?.boundNodeId == nodeId { tripBlackholeKillSwitch() }
+        if activeNodeId == nodeId {
+            tripBlackholeKillSwitch()
+            activeNodeId = nil
+            storage.saveActiveNodeId(nil)
+        }
         do {
             try commitCatalog(nodes: nodes.filter { $0.id != nodeId }, subscriptions: subscriptions)
         } catch { recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription) }
@@ -689,7 +639,7 @@ final class VpnManagerEngine: ObservableObject {
         do {
             try commitCatalog(nodes: updated, subscriptions: subscriptions)
             recordLocalEvent(.warn, tag: "NODES", "已\(skip ? "开启" : "关闭")「\(updated[idx].name)」跳过 TLS 证书验证")
-            if activeSession?.boundNodeId == nodeId && vpnStatus == .connected {
+            if activeNodeId == nodeId && vpnStatus == .connected {
                 pushCurrentPayloadToRunningTunnel()
             }
         } catch {
@@ -718,7 +668,7 @@ final class VpnManagerEngine: ObservableObject {
             try commitCatalog(nodes: updated, subscriptions: subscriptions)
             let label = clean.isEmpty ? (isReality ? "chrome" : "默认") : clean
             recordLocalEvent(.info, tag: "NODES", "已将「\(updated[idx].name)」uTLS 指纹切换为 \(label)")
-            if activeSession?.boundNodeId == nodeId && vpnStatus == .connected {
+            if activeNodeId == nodeId && vpnStatus == .connected {
                 pushCurrentPayloadToRunningTunnel()
             }
         } catch {
