@@ -697,6 +697,35 @@ final class VpnManagerEngine: ObservableObject {
         }
     }
 
+    func setNodeUtlsFingerprint(nodeId: UUID, fingerprint: String) {
+        let clean = fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let idx = nodes.firstIndex(where: { $0.id == nodeId }),
+              let data = nodes[idx].singBoxOutboundJson.data(using: .utf8),
+              var outbound = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var tls = outbound["tls"] as? [String: Any] else { return }
+        let isReality = (tls["reality"] as? [String: Any])?["enabled"] as? Bool == true
+        if clean.isEmpty && !isReality {
+            tls.removeValue(forKey: "utls")
+        } else {
+            tls["utls"] = ["enabled": true, "fingerprint": clean.isEmpty ? "chrome" : clean]
+        }
+        outbound["tls"] = tls
+        guard let nextData = try? JSONSerialization.data(withJSONObject: outbound),
+              let nextJson = String(data: nextData, encoding: .utf8) else { return }
+        var updated = nodes
+        updated[idx].singBoxOutboundJson = nextJson
+        do {
+            try commitCatalog(nodes: updated, subscriptions: subscriptions)
+            let label = clean.isEmpty ? (isReality ? "chrome" : "默认") : clean
+            recordLocalEvent(.info, tag: "NODES", "已将「\(updated[idx].name)」uTLS 指纹切换为 \(label)")
+            if activeSession?.boundNodeId == nodeId && vpnStatus == .connected {
+                pushCurrentPayloadToRunningTunnel()
+            }
+        } catch {
+            recordLocalEvent(.critical, tag: "STORAGE", error.localizedDescription)
+        }
+    }
+
     func testNodeIsolated(_ node: ProxyNode) async -> ExitCheckResult {
         if vpnStatus == .connected && settings.globalMode && snapshot.status == .blackholeKillSwitch {
             return ExitCheckResult(success: false, error: "当前处于「全局黑洞熔断」状态，已拦截整机出口；请先关闭全局模式或停止 VPN 后再测速")
@@ -726,7 +755,12 @@ final class VpnManagerEngine: ObservableObject {
         if !check.success {
             let diagLine = Self.extractCoreErrorHint(from: rawCoreLogs)
             if let diagLine {
-                check.error = "\(check.error ?? "测速失败") | sing-box: \(diagLine)"
+                var extraHint = ""
+                if diagLine.lowercased().contains("reality verification failed"),
+                   let fp = Self.extractNodeUtlsFingerprint(node), fp != "chrome" {
+                    extraHint = "（当前 uTLS 指纹为 \(fp)，新版 Xray REALITY 需使用 chrome，请点右侧滑块切换）"
+                }
+                check.error = "\(check.error ?? "测速失败") | sing-box: \(diagLine)\(extraHint)"
                 recordLocalEvent(.warn, tag: "PROBE", "「\(node.name)」测速内核日志: \(diagLine)")
             }
         }
@@ -740,6 +774,15 @@ final class VpnManagerEngine: ObservableObject {
             catch { recordLocalEvent(.warn, tag: "STORAGE", error.localizedDescription) }
         }
         return check
+    }
+
+    private static func extractNodeUtlsFingerprint(_ node: ProxyNode) -> String? {
+        guard let data = node.singBoxOutboundJson.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let tls = obj["tls"] as? [String: Any],
+              let utls = tls["utls"] as? [String: Any],
+              let fp = utls["fingerprint"] as? String else { return nil }
+        return fp.lowercased()
     }
 
     private static func stripANSI(_ text: String) -> String {

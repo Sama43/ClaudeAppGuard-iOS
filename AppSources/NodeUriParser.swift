@@ -433,7 +433,10 @@ enum NodeUriParser {
 
     private static func normalizeFingerprint(_ raw: String?, requiredForReality: Bool) -> String? {
         if let fp = raw?.nilIfEmpty?.lowercased(), fp != "none" {
-            return fp == "random" ? "randomized" : fp
+            if fp == "random" {
+                return requiredForReality ? "chrome" : "randomized"
+            }
+            return fp
         }
         return requiredForReality ? "chrome" : nil
     }

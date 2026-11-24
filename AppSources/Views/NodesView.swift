@@ -313,6 +313,17 @@ private struct NodeInspectorSheet: View {
     private var tlsDict: [String: Any]? { parsedOutbound["tls"] as? [String: Any] }
     private var hasTls: Bool { tlsDict?["enabled"] as? Bool == true }
     private var hasReality: Bool { (tlsDict?["reality"] as? [String: Any])?["enabled"] as? Bool == true }
+    private var currentFingerprint: String {
+        ((tlsDict?["utls"] as? [String: Any])?["fingerprint"] as? String)?.lowercased() ?? (hasReality ? "chrome" : "")
+    }
+    private let realityFingerprintOptions: [(id: String, label: String)] = [
+        ("chrome", "chrome（推荐 · 支持 Xray ML-KEM）"),
+        ("firefox", "firefox"),
+        ("safari", "safari"),
+        ("ios", "ios"),
+        ("edge", "edge"),
+        ("randomized", "randomized")
+    ]
 
     private var redactedPrettyJson: String {
         var copy = parsedOutbound
@@ -346,6 +357,28 @@ private struct NodeInspectorSheet: View {
                     if let reality = tlsDict?["reality"] as? [String: Any], reality["enabled"] as? Bool == true {
                         let sid = (reality["short_id"] as? String) ?? ""
                         LabeledContent("Reality", value: "已启用 (short_id 长度 \(sid.count))")
+                    }
+                    if !currentFingerprint.isEmpty {
+                        LabeledContent("uTLS 指纹", value: currentFingerprint)
+                    }
+                }
+
+                if hasReality {
+                    Section("REALITY uTLS 指纹") {
+                        Picker("客户端指纹", selection: Binding(
+                            get: {
+                                let cur = currentFingerprint
+                                return realityFingerprintOptions.contains(where: { $0.id == cur }) ? cur : "chrome"
+                            },
+                            set: { engine.setNodeUtlsFingerprint(nodeId: node.id, fingerprint: $0) }
+                        )) {
+                            ForEach(realityFingerprintOptions, id: \.id) { opt in
+                                Text(opt.label).tag(opt.id)
+                            }
+                        }
+                        Text("Xray-core v26.9.8+ REALITY 服务端强制要求后量子 X25519MLKEM768 密钥交换，请优先使用 chrome 指纹。")
+                            .font(.caption2)
+                            .foregroundStyle(VpnTheme.textSecondary)
                     }
                 }
 

@@ -11,10 +11,15 @@ enum TunnelSingBoxConfigGenerator {
     static let claudeDomainSuffixes: [String] = [
         "claude.ai",
         "anthropic.com",
+        "anthropic.ai",
         "claude.com",
+        "claudecode.com",
+        "claude.gg",
+        "claude-assets.com",
         "claudeusercontent.com",
         "claudemcpclient.com",
         "cloudflare.com",
+        "cloudflare-ech.com",
         "challenges.cloudflare.com",
         "cloudflareinsights.com",
         "arkoselabs.com",
@@ -35,6 +40,12 @@ enum TunnelSingBoxConfigGenerator {
         "stytch.com",
         "auth0.com",
         "workos.com"
+    ]
+
+    /// Anthropic AS399358 IP ranges so even pre-VPN cached DNS or SNI-less traffic never goes direct.
+    static let anthropicIpCidrs: [String] = [
+        "160.79.104.0/21",
+        "2607:6bc0::/48"
     ]
 
     static let authHelperDomainSuffixes: [String] = [
@@ -125,10 +136,23 @@ enum TunnelSingBoxConfigGenerator {
 
         var dnsRules: [[String: Any]] = []
         if settings.globalMode {
-            // Global mode: A/AAAA -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy
+            // Suppress HTTPS/SVCB records so iOS NSURLSession cannot bypass FakeIP via ipv4hint/ECH/QUIC.
+            dnsRules.append([
+                "query_type": ["HTTPS", "SVCB"],
+                "action": "predefined",
+                "rcode": "NOERROR"
+            ])
+            // Global mode: A/AAAA -> FakeIP, other queries -> Remote DoH over guard
             dnsRules.append(["query_type": ["A", "AAAA"], "server": "dns_fakeip"])
         } else {
-            // Split mode: Claude/Anthropic A/AAAA -> FakeIP, HTTPS/SVCB -> Remote DoH over proxy; Chinese apps -> fast local DNS
+            // Suppress HTTPS/SVCB records for Claude/Auth domains so iOS never uses ipv4hint/ECH to bypass FakeIP/SNI.
+            dnsRules.append([
+                "domain_suffix": targetDomains,
+                "query_type": ["HTTPS", "SVCB"],
+                "action": "predefined",
+                "rcode": "NOERROR"
+            ])
+            // Split mode: Claude/Anthropic A/AAAA -> FakeIP, other record types -> Remote DoH over guard; Chinese apps -> fast local DNS
             dnsRules.append([
                 "domain_suffix": targetDomains,
                 "query_type": ["A", "AAAA"],
@@ -153,9 +177,11 @@ enum TunnelSingBoxConfigGenerator {
             routeRules.append(["network": "udp", "port": [443], "action": "reject"])
             routeFinal = "guard"
         } else {
+            let guardCidrs = ["198.18.0.0/15", "fc00::/18"] + anthropicIpCidrs
             routeRules.append(["network": "udp", "port": [443], "domain_suffix": targetDomains, "action": "reject"])
+            routeRules.append(["network": "udp", "port": [443], "ip_cidr": guardCidrs, "action": "reject"])
             routeRules.append(["domain_suffix": targetDomains, "outbound": "guard"])
-            routeRules.append(["ip_cidr": ["198.18.0.0/15", "fc00::/18"], "outbound": "guard"])
+            routeRules.append(["ip_cidr": guardCidrs, "outbound": "guard"])
             routeFinal = "direct"
         }
 

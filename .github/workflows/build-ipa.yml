@@ -67,10 +67,12 @@ jobs:
         run: |
           git clone --depth 1 --branch v1.14.4 https://github.com/SagerNet/sing-box.git /tmp/sing-box
           test "$(git -C /tmp/sing-box rev-parse HEAD)" = c005f35300ce76427dc285481ec5695f5b179cd2
+          git -C /tmp/sing-box apply --check "${GITHUB_WORKSPACE}/corebridge/patches/reality-mlkem-keyshare.patch"
+          git -C /tmp/sing-box apply "${GITHUB_WORKSPACE}/corebridge/patches/reality-mlkem-keyshare.patch"
           mkdir -p /tmp/sing-box/corebridge
           cp corebridge/*.go /tmp/sing-box/corebridge/
           cd /tmp/sing-box
-          GUARD_TEST_CONFIGS="$RUNNER_TEMP/guard-configs" go test -tags with_gvisor ./corebridge
+          GUARD_TEST_CONFIGS="$RUNNER_TEMP/guard-configs" go test -v -tags "with_gvisor,with_utls" ./corebridge
           gomobile init
           mkdir -p "${GITHUB_WORKSPACE}/Frameworks"
           gomobile bind -v \

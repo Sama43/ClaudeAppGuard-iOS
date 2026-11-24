@@ -24,13 +24,15 @@ struct TunnelConfigTests {
             let dnsServers = dns["servers"] as! [[String: Any]]
             let dnsRemote = dnsServers.first { $0["tag"] as? String == "dns_remote" }!
             precondition(dnsRemote["detour"] as? String == "guard")
+            let dnsRules = dns["rules"] as! [[String: Any]]
+            precondition(dnsRules.contains { ($0["query_type"] as? [String]) == ["HTTPS", "SVCB"] && $0["action"] as? String == "predefined" && $0["rcode"] as? String == "NOERROR" })
             let route = root["route"] as! [String: Any]
             precondition(route["final"] as? String == (global ? "guard" : "direct"))
             let rules = route["rules"] as! [[String: Any]]
             precondition(rules.contains { $0["inbound"] as? [String] == ["mixed-in"] && $0["outbound"] as? String == tag })
             if !global {
                 precondition(rules.contains { $0["domain_suffix"] != nil && $0["outbound"] as? String == "guard" })
-                precondition(rules.contains { $0["ip_cidr"] != nil && $0["outbound"] as? String == "guard" })
+                precondition(rules.contains { ($0["ip_cidr"] as? [String])?.contains("160.79.104.0/21") == true && $0["outbound"] as? String == "guard" })
             }
             try config.write(to: directory.appendingPathComponent("tunnel-\(global).json"), atomically: true, encoding: .utf8)
         }

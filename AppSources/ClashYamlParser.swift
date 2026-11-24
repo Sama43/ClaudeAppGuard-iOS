@@ -263,7 +263,10 @@ enum ClashYamlParser {
     private static func normalizeFingerprint(_ raw: String?, requiredForReality: Bool) -> String? {
         let cleaned = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let fp = cleaned, !fp.isEmpty, fp != "none" {
-            return fp == "random" ? "randomized" : fp
+            if fp == "random" {
+                return requiredForReality ? "chrome" : "randomized"
+            }
+            return fp
         }
         return requiredForReality ? "chrome" : nil
     }
