@@ -219,6 +219,18 @@ struct ShieldDashboardView: View {
             .tint(VpnTheme.accentTeal)
 
             Toggle(isOn: Binding(
+                get: { engine.settings.enableOnDemand },
+                set: { v in engine.updateSettings { $0.enableOnDemand = v } }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("iOS 按需常驻（防扩展被杀后直连）").font(.caption.bold()).foregroundStyle(VpnTheme.textPrimary)
+                    Text("开启后若系统强杀后台扩展或重启设备，会自动重拉隔离并先进入黑洞；手动点「关闭 VPN」时会自动解除。")
+                        .font(.caption2).foregroundStyle(VpnTheme.textSecondary)
+                }
+            }
+            .tint(VpnTheme.accentTeal)
+
+            Toggle(isOn: Binding(
                 get: { engine.settings.includeAuthHelperDomains },
                 set: { v in engine.updateSettings { $0.includeAuthHelperDomains = v } }
             )) {

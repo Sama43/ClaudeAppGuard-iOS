@@ -346,8 +346,9 @@ final class VpnManagerEngine: ObservableObject {
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = "ClaudeAppGuard 官方客户端隔离"
         mgr.isEnabled = true
+        applyOnDemandConfig(to: mgr, enabled: settings.enableOnDemand)
 
-        recordLocalEvent(.info, tag: "VPN", "准备拉起扩展 [\(resolvedExtensionId)] -> 节点 \(node.name) (AppGroup=\(appGroupAvailable ? "可用" : "降级IPC+环回直传"))")
+        recordLocalEvent(.info, tag: "VPN", "准备拉起扩展 [\(resolvedExtensionId)] -> 节点 \(node.name) (OnDemand=\(settings.enableOnDemand ? "开" : "关"), AppGroup=\(appGroupAvailable ? "可用" : "降级IPC+环回直传"))")
 
         mgr.saveToPreferences { [weak self] err in
             Task { @MainActor [weak self] in
@@ -387,6 +388,18 @@ final class VpnManagerEngine: ObservableObject {
         }
     }
 
+    private func applyOnDemandConfig(to mgr: NETunnelProviderManager, enabled: Bool) {
+        if enabled {
+            let connectRule = NEOnDemandRuleConnect()
+            connectRule.interfaceTypeMatch = .any
+            mgr.onDemandRules = [connectRule]
+            mgr.isOnDemandEnabled = true
+        } else {
+            mgr.isOnDemandEnabled = false
+            mgr.onDemandRules = nil
+        }
+    }
+
     private func persistLiveConfiguration(payloadData: Data, server: String) {
         guard let mgr = manager else { return }
         let proto = (mgr.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
@@ -395,6 +408,7 @@ final class VpnManagerEngine: ObservableObject {
         proto.providerConfiguration = ["payload": payloadData]
         mgr.protocolConfiguration = proto
         mgr.isEnabled = true
+        applyOnDemandConfig(to: mgr, enabled: settings.enableOnDemand)
         mgr.saveToPreferences { _ in }
     }
 
@@ -449,19 +463,25 @@ final class VpnManagerEngine: ObservableObject {
         let attempt = startAttemptId
         pendingAutoRetryNodeId = nil
         startupWatchTask?.cancel()
-        if vpnStatus == .connected {
+        let wasConnected = vpnStatus == .connected
+        if wasConnected {
             sendTunnelCommand("kill_switch")
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 180_000_000)
-                guard let self, self.startAttemptId == attempt else { return }
-                self.manager?.connection.stopVPNTunnel()
+        }
+        if let mgr = manager {
+            applyOnDemandConfig(to: mgr, enabled: false)
+            mgr.saveToPreferences { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    if wasConnected {
+                        try? await Task.sleep(nanoseconds: 180_000_000)
+                    }
+                    guard let self, self.startAttemptId == attempt else { return }
+                    self.manager?.connection.stopVPNTunnel()
+                }
             }
-        } else {
-            manager?.connection.stopVPNTunnel()
         }
         snapshot.status = .stopped
         snapshot.killSwitchReason = nil
-        recordLocalEvent(.info, tag: "VPN", "已先切断 Claude 后台连接并关闭系统 VPN")
+        recordLocalEvent(.info, tag: "VPN", "已切断 Claude 后台连接、解除按需常驻并关闭系统 VPN")
     }
 
     private func sendReloadPayload(_ payloadData: Data) {
@@ -766,6 +786,9 @@ final class VpnManagerEngine: ObservableObject {
         storage.saveSettings(copy)
         if vpnStatus == .connected {
             pushCurrentPayloadToRunningTunnel()
+        } else if !copy.enableOnDemand, let mgr = manager, mgr.isOnDemandEnabled {
+            applyOnDemandConfig(to: mgr, enabled: false)
+            mgr.saveToPreferences { _ in }
         }
     }
 

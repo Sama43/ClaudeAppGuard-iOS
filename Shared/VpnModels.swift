@@ -106,6 +106,43 @@ struct VpnGuardSettings: Codable, Equatable {
     var pinnedExitIp: String? = nil
     var watchdogIntervalSec: Int = 5
     var killOnNetworkChange: Bool = true
+    /// iOS NEOnDemandRuleConnect: auto-respawns PacketTunnel in sealed blackhole mode if iOS kills the extension or reboots.
+    var enableOnDemand: Bool = true
+
+    init(
+        globalMode: Bool = false,
+        includeAuthHelperDomains: Bool = true,
+        blockedCountries: Set<String> = defaultBlockedCountries,
+        allowedCountries: Set<String> = [],
+        lockExitIp: Bool = false,
+        pinnedExitIp: String? = nil,
+        watchdogIntervalSec: Int = 5,
+        killOnNetworkChange: Bool = true,
+        enableOnDemand: Bool = true
+    ) {
+        self.globalMode = globalMode
+        self.includeAuthHelperDomains = includeAuthHelperDomains
+        self.blockedCountries = blockedCountries
+        self.allowedCountries = allowedCountries
+        self.lockExitIp = lockExitIp
+        self.pinnedExitIp = pinnedExitIp
+        self.watchdogIntervalSec = watchdogIntervalSec
+        self.killOnNetworkChange = killOnNetworkChange
+        self.enableOnDemand = enableOnDemand
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        globalMode = try c.decodeIfPresent(Bool.self, forKey: .globalMode) ?? false
+        includeAuthHelperDomains = try c.decodeIfPresent(Bool.self, forKey: .includeAuthHelperDomains) ?? true
+        blockedCountries = try c.decodeIfPresent(Set<String>.self, forKey: .blockedCountries) ?? Self.defaultBlockedCountries
+        allowedCountries = try c.decodeIfPresent(Set<String>.self, forKey: .allowedCountries) ?? []
+        lockExitIp = try c.decodeIfPresent(Bool.self, forKey: .lockExitIp) ?? false
+        pinnedExitIp = try c.decodeIfPresent(String.self, forKey: .pinnedExitIp)
+        watchdogIntervalSec = try c.decodeIfPresent(Int.self, forKey: .watchdogIntervalSec) ?? 5
+        killOnNetworkChange = try c.decodeIfPresent(Bool.self, forKey: .killOnNetworkChange) ?? true
+        enableOnDemand = try c.decodeIfPresent(Bool.self, forKey: .enableOnDemand) ?? true
+    }
 }
 
 enum TunnelGuardStatus: String, Codable {
