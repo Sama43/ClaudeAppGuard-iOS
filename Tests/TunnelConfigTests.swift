@@ -14,21 +14,25 @@ struct TunnelConfigTests {
             let root = try JSONSerialization.jsonObject(with: Data(config.utf8)) as! [String: Any]
             let experimental = root["experimental"] as! [String: [String: Any]]
             let file = experimental["cache_file"]!
-            precondition(file["path"] as? String == cache.path && file["store_fakeip"] as? Bool == true)
+            precondition(file["path"] as? String == cache.path && file["enabled"] as? Bool == true)
             let outbounds = root["outbounds"] as! [[String: Any]]
             let selector = outbounds.first { $0["tag"] as? String == "guard" }!
             precondition(selector["default"] as? String == "sealed")
             precondition(selector["outbounds"] as? [String] == ["sealed", tag])
             precondition(selector["interrupt_exist_connections"] as? Bool == true)
             let dns = root["dns"] as! [String: Any]
+            precondition(dns["strategy"] as? String == "ipv4_only")
+            precondition(dns["reverse_mapping"] as? Bool == true)
             let dnsServers = dns["servers"] as! [[String: Any]]
             let dnsRemote = dnsServers.first { $0["tag"] as? String == "dns_remote" }!
             precondition(dnsRemote["detour"] as? String == "guard")
             let dnsRules = dns["rules"] as! [[String: Any]]
-            precondition(dnsRules.contains { ($0["query_type"] as? [String]) == ["HTTPS", "SVCB"] && $0["action"] as? String == "predefined" && $0["rcode"] as? String == "NOERROR" })
+            precondition(dnsRules.contains { ($0["query_type"] as? [String])?.contains("AAAA") == true && $0["action"] as? String == "predefined" && $0["rcode"] as? String == "NOERROR" })
+            precondition(dnsRules.contains { ($0["query_type"] as? [String])?.contains("HTTPS") == true && $0["action"] as? String == "predefined" && $0["rcode"] as? String == "NOERROR" })
             let route = root["route"] as! [String: Any]
             precondition(route["final"] as? String == (global ? "guard" : "direct"))
             let rules = route["rules"] as! [[String: Any]]
+            precondition(rules.contains { $0["ip_version"] as? Int == 6 && $0["action"] as? String == "reject" })
             precondition(rules.contains { $0["inbound"] as? [String] == ["mixed-in"] && $0["outbound"] as? String == tag })
             if !global {
                 precondition(rules.contains { $0["domain_suffix"] != nil && $0["outbound"] as? String == "guard" })

@@ -82,9 +82,9 @@ enum ExitIpVerifier {
             return error.localizedDescription
         }
 
-        // 1. Primary check: Cloudflare trace (hostname)
+        // 1. Primary check: pure IPv4 Cloudflare trace (forces dual-stack proxies like AnyTLS/HiNet to exit over IPv4!)
         let primaryBudget = min(max(3.5, timeoutSec * 0.55), timeoutSec)
-        if let url = URL(string: "https://www.cloudflare.com/cdn-cgi/trace") {
+        if let url = URL(string: "https://1.1.1.1/cdn-cgi/trace") {
             do {
                 var req = URLRequest(url: url, timeoutInterval: primaryBudget)
                 req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
@@ -95,15 +95,15 @@ enum ExitIpVerifier {
                     country = parsed.1
                 } else {
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                    errors.append("CF HTTP \(code)")
+                    errors.append("1.1.1.1 HTTP \(code)")
                 }
             } catch {
                 errors.append(describeError(error))
             }
         }
 
-        // 2. Fast zero-DNS fallback: Cloudflare 1.1.1.1 anycast IP
-        if exitIp == nil || country == nil, let url = URL(string: "https://1.1.1.1/cdn-cgi/trace") {
+        // 2. Second pure IPv4 fallback: Cloudflare 1.0.0.1 anycast IP
+        if exitIp == nil || country == nil, let url = URL(string: "https://1.0.0.1/cdn-cgi/trace") {
             let remaining = deadline - ProcessInfo.processInfo.systemUptime
             if remaining > 0.4, !Task.isCancelled {
                 do {
@@ -116,7 +116,7 @@ enum ExitIpVerifier {
                         country = parsed.1
                     } else {
                         let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                        errors.append("1.1.1.1 HTTP \(code)")
+                        errors.append("1.0.0.1 HTTP \(code)")
                     }
                 } catch {
                     errors.append(describeError(error))
@@ -124,7 +124,29 @@ enum ExitIpVerifier {
             }
         }
 
-        // 3. Secondary fallback: api.country.is
+        // 3. Hostname fallback: www.cloudflare.com trace
+        if exitIp == nil || country == nil, let url = URL(string: "https://www.cloudflare.com/cdn-cgi/trace") {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            if remaining > 0.4, !Task.isCancelled {
+                do {
+                    var req = URLRequest(url: url, timeoutInterval: min(remaining, max(2.0, remaining * 0.55)))
+                    req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+                    let (data, resp) = try await session.data(for: req)
+                    if let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                       let parsed = parseCloudflareTrace(data) {
+                        exitIp = parsed.0
+                        country = parsed.1
+                    } else {
+                        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                        errors.append("CF HTTP \(code)")
+                    }
+                } catch {
+                    errors.append(describeError(error))
+                }
+            }
+        }
+
+        // 4. Final fallback: api.country.is
         if exitIp == nil || country == nil, let url = URL(string: "https://api.country.is/") {
             let remaining = deadline - ProcessInfo.processInfo.systemUptime
             if remaining > 0.3, !Task.isCancelled {

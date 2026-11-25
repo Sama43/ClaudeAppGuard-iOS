@@ -110,7 +110,8 @@ enum TunnelSingBoxConfigGenerator {
             ? (claudeDomainSuffixes + authHelperDomainSuffixes)
             : claudeDomainSuffixes
 
-        // DNS servers: FakeIP for protected domains so zero local ISP DNS queries leak!
+        // DNS servers: pure IPv4 DoH over guard + reverse_mapping so remote dual-stack proxies (AnyTLS/HiNet)
+        // receive IPv4 target addresses instead of hostnames that could dial out over IPv6!
         let dnsServers: [[String: Any]] = [
             [
                 "tag": "dns_remote",
@@ -125,39 +126,32 @@ enum TunnelSingBoxConfigGenerator {
                 "type": "udp",
                 "server": "223.5.5.5",
                 "server_port": 53
-            ],
-            [
-                "tag": "dns_fakeip",
-                "type": "fakeip",
-                "inet4_range": "198.18.0.0/15",
-                "inet6_range": "fc00::/18"
             ]
         ]
 
         var dnsRules: [[String: Any]] = []
         if settings.globalMode {
-            // Suppress HTTPS/SVCB records so iOS NSURLSession cannot bypass FakeIP via ipv4hint/ECH/QUIC.
+            // Suppress AAAA + HTTPS/SVCB globally: disables IPv6 and prevents ECH/ipv4hint/QUIC bypass.
             dnsRules.append([
-                "query_type": ["HTTPS", "SVCB"],
+                "query_type": ["AAAA", "HTTPS", "SVCB"],
                 "action": "predefined",
                 "rcode": "NOERROR"
             ])
-            // Global mode: A/AAAA -> FakeIP, other queries -> Remote DoH over guard
-            dnsRules.append(["query_type": ["A", "AAAA"], "server": "dns_fakeip"])
         } else {
-            // Suppress HTTPS/SVCB records for Claude/Auth domains so iOS never uses ipv4hint/ECH to bypass FakeIP/SNI.
+            // Suppress ALL AAAA queries system-wide so IPv6 is disabled without leaking outside the VPN.
+            dnsRules.append([
+                "query_type": ["AAAA"],
+                "action": "predefined",
+                "rcode": "NOERROR"
+            ])
+            // Suppress HTTPS/SVCB records for Claude/Auth domains so iOS never uses ipv4hint/ECH/QUIC bypass.
             dnsRules.append([
                 "domain_suffix": targetDomains,
                 "query_type": ["HTTPS", "SVCB"],
                 "action": "predefined",
                 "rcode": "NOERROR"
             ])
-            // Split mode: Claude/Anthropic A/AAAA -> FakeIP, other record types -> Remote DoH over guard; Chinese apps -> fast local DNS
-            dnsRules.append([
-                "domain_suffix": targetDomains,
-                "query_type": ["A", "AAAA"],
-                "server": "dns_fakeip"
-            ])
+            // Split mode: resolve Claude/Auth A records strictly via remote 1.1.1.1 DoH over guard (IPv4-only, zero local DNS leak).
             dnsRules.append([
                 "domain_suffix": targetDomains,
                 "server": "dns_remote"
@@ -167,6 +161,8 @@ enum TunnelSingBoxConfigGenerator {
         var routeRules: [[String: Any]] = [
             ["action": "sniff"],
             ["protocol": "dns", "action": "hijack-dns"],
+            // Reject all IPv6 packets captured by TUN so IPv6 is strictly disabled with zero direct leak.
+            ["ip_version": 6, "action": "reject"],
             // Local probe inbound ALWAYS routes strictly via proxy for Exit IP Watchdog
             ["inbound": ["mixed-in"], "outbound": proxyTag]
         ]
@@ -177,22 +173,22 @@ enum TunnelSingBoxConfigGenerator {
             routeRules.append(["network": "udp", "port": [443], "action": "reject"])
             routeFinal = "guard"
         } else {
-            let guardCidrs = ["198.18.0.0/15", "fc00::/18"] + anthropicIpCidrs
             routeRules.append(["network": "udp", "port": [443], "domain_suffix": targetDomains, "action": "reject"])
-            routeRules.append(["network": "udp", "port": [443], "ip_cidr": guardCidrs, "action": "reject"])
+            routeRules.append(["network": "udp", "port": [443], "ip_cidr": anthropicIpCidrs, "action": "reject"])
             routeRules.append(["domain_suffix": targetDomains, "outbound": "guard"])
-            routeRules.append(["ip_cidr": guardCidrs, "outbound": "guard"])
+            routeRules.append(["ip_cidr": anthropicIpCidrs, "outbound": "guard"])
             routeFinal = "direct"
         }
 
         let root: [String: Any] = [
-            "experimental": ["cache_file": ["enabled": true, "path": cacheURL.path, "store_fakeip": true]],
+            "experimental": ["cache_file": ["enabled": true, "path": cacheURL.path]],
             "log": ["level": "info", "timestamp": false],
             "dns": [
                 "servers": dnsServers,
                 "rules": dnsRules,
                 "final": settings.globalMode ? "dns_remote" : "dns_local",
-                "strategy": "ipv4_only"
+                "strategy": "ipv4_only",
+                "reverse_mapping": true
             ],
             "inbounds": [
                 [

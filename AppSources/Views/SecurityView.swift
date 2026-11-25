@@ -15,7 +15,7 @@ struct SecurityView: View {
                     row("配置通道", engine.appGroupAvailable ? "App Group + 环回鉴权控制" : "环回鉴权直传（兼容重签）", true)
                     row("隧道模式", engine.settings.globalMode ? "全局代理 + 全局黑洞" : "仅隔离 Claude 域名（国内直连）", true)
                     row("防杀后台常驻", engine.settings.enableOnDemand ? "已开启 (iOS On-Demand)" : "已关闭", engine.settings.enableOnDemand)
-                    row("DNS 防泄露", "TUN 172.19.0.1 + FakeIP 198.18.0.0/15 + DoH", true)
+                    row("DNS / IPv6 防护", "纯 IPv4 强制 (DoH 1.1.1.1 + 已关闭 IPv6/AAAA)", true)
                     row("当前出口", [engine.snapshot.exitCountry, engine.snapshot.exitIp, engine.snapshot.exitCity].compactMap { $0 }.joined(separator: " · ").nonEmpty ?? "未校验", engine.snapshot.exitIp != nil)
 
                     if let err = engine.lastDisconnectError, !err.isEmpty {
