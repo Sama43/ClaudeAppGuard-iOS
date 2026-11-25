@@ -61,6 +61,7 @@ enum NodeUriParser {
         case "ss": return try parseShadowsocks(trimmed)
         case "hysteria2", "hy2": return try parseHysteria2(trimmed)
         case "tuic": return try parseTuic(trimmed)
+        case "anytls": return try parseAnytls(trimmed)
         case "socks", "socks5": return try parseSocks5(trimmed)
         case "http", "https": return try parseHttp(trimmed)
         default: throw err("不支持的协议: \(scheme)")
@@ -338,6 +339,52 @@ enum NodeUriParser {
         return ProxyNode(name: name, protocol: .tuic, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
     }
 
+    private static func parseAnytls(_ raw: String) throws -> ProxyNode {
+        let (compsOpt, fragmentName) = splitUriAndFragment(raw)
+        guard let comps = compsOpt,
+              let host = comps.host?.nilIfEmpty else {
+            throw err("AnyTLS 链接缺少服务器地址")
+        }
+        let userPart = comps.user?.removingPercentEncoding ?? ""
+        let passPart = comps.password?.removingPercentEncoding
+        let password = passPart.map { "\(userPart):\($0)" } ?? userPart
+        guard !password.isEmpty else {
+            throw err("AnyTLS 链接缺少密码")
+        }
+        let port = comps.port ?? 443
+        let params = queryDict(comps)
+        let name = fragmentName ?? "AnyTLS-\(host):\(port)"
+        let insecure = isTruthy(firstNonEmpty(params, ["insecure", "allowinsecure", "allow_insecure", "skip-cert-verify", "skip_cert_verify"]))
+        let fp = normalizeFingerprint(firstNonEmpty(params, ["fp", "fingerprint", "client-fingerprint", "client_fingerprint"]), requiredForReality: false)
+
+        var outbound: [String: Any] = [
+            "type": "anytls",
+            "tag": "proxy",
+            "server": host,
+            "server_port": port,
+            "password": password,
+            "tls": buildTls(
+                serverName: firstNonEmpty(params, ["sni", "servername", "peer"]) ?? host,
+                insecure: insecure,
+                alpn: firstNonEmpty(params, ["alpn"]),
+                fp: fp,
+                realityPub: nil,
+                realitySid: nil
+            )
+        ]
+        if let checkInterval = formatGoDuration(firstNonEmpty(params, ["idle_session_check_interval", "idle-session-check-interval"])) {
+            outbound["idle_session_check_interval"] = checkInterval
+        }
+        if let idleTimeout = formatGoDuration(firstNonEmpty(params, ["idle_session_timeout", "idle-session-timeout"])) {
+            outbound["idle_session_timeout"] = idleTimeout
+        }
+        if let minIdleStr = firstNonEmpty(params, ["min_idle_session", "min-idle-session"]),
+           let minIdle = Int(minIdleStr), minIdle >= 0 {
+            outbound["min_idle_session"] = minIdle
+        }
+        return ProxyNode(name: name, protocol: .anytls, server: host, port: port, rawUri: raw, singBoxOutboundJson: toJson(outbound))
+    }
+
     private static func parseSocks5(_ raw: String) throws -> ProxyNode {
         let (compsOpt, fragmentName) = splitUriAndFragment(raw)
         guard let comps = compsOpt, let host = comps.host?.nilIfEmpty else {
@@ -414,6 +461,7 @@ enum NodeUriParser {
             case "shadowsocks": proto = .shadowsocks
             case "hysteria2": proto = .hysteria2
             case "tuic": proto = .tuic
+            case "anytls": proto = .anytls
             case "socks": proto = .socks5
             case "http": proto = .http
             default: proto = .rawSingBox
@@ -444,6 +492,14 @@ enum NodeUriParser {
     private static func normalizeShortId(_ raw: String?) -> String? {
         guard let sid = raw?.nilIfEmpty else { return nil }
         return sid.count % 2 == 1 ? "0" + sid : sid
+    }
+
+    private static func formatGoDuration(_ raw: String?) -> String? {
+        guard let v = raw?.nilIfEmpty else { return nil }
+        if v.allSatisfy({ $0.isNumber }) {
+            return "\(v)s"
+        }
+        return v
     }
 
     private static func buildTls(

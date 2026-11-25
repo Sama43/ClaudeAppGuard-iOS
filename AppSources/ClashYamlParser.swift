@@ -227,6 +227,33 @@ enum ClashYamlParser {
                 realitySid: nil
             )
 
+        case "anytls":
+            guard let password = str(m, "password"), !password.isEmpty else {
+                throw NSError(domain: "ClashYaml", code: 6, userInfo: [NSLocalizedDescriptionKey: "缺少 password"])
+            }
+            proto = .anytls
+            outbound["type"] = "anytls"
+            outbound["password"] = password
+            if let checkInterval = formatGoDuration(str(m, "idle-session-check-interval") ?? str(m, "idle_session_check_interval")) {
+                outbound["idle_session_check_interval"] = checkInterval
+            }
+            if let idleTimeout = formatGoDuration(str(m, "idle-session-timeout") ?? str(m, "idle_session_timeout")) {
+                outbound["idle_session_timeout"] = idleTimeout
+            }
+            if let minIdle = intVal(m, "min-idle-session") ?? intVal(m, "min_idle_session"), minIdle >= 0 {
+                outbound["min_idle_session"] = minIdle
+            }
+            let fp = normalizeFingerprint(str(m, "client-fingerprint") ?? str(m, "fingerprint") ?? str(m, "fp"), requiredForReality: false)
+            outbound["tls"] = buildTls(
+                server: server,
+                sni: str(m, "sni") ?? str(m, "servername") ?? str(m, "peer"),
+                insecure: insecure,
+                alpn: strList(m, "alpn"),
+                fp: fp,
+                realityPub: nil,
+                realitySid: nil
+            )
+
         case "socks5":
             proto = .socks5
             outbound["type"] = "socks"
@@ -274,6 +301,14 @@ enum ClashYamlParser {
     private static func normalizeShortId(_ raw: String?) -> String? {
         guard let sid = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !sid.isEmpty else { return nil }
         return sid.count % 2 == 1 ? "0" + sid : sid
+    }
+
+    private static func formatGoDuration(_ raw: String?) -> String? {
+        guard let v = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty else { return nil }
+        if v.allSatisfy({ $0.isNumber }) {
+            return "\(v)s"
+        }
+        return v
     }
 
     private static func extractTransportHost(_ m: [String: Any]) -> String? {
